@@ -12,6 +12,7 @@
 import Alamofire
 import AVFoundation
 import AVKit
+import Combine
 import Kingfisher
 import OpenHABCore
 import os.log
@@ -46,9 +47,12 @@ struct OpenHABImageProcessor: ImageProcessor {
                 let svgkSourceNSData = SVGKSourceNSData.source(from: data, urlForRelativeLinks: nil)
                 let parseResults = SVGKParser.parseSource(usingDefaultSVGKParser: svgkSourceNSData)
                 if parseResults?.parsedDocument != nil, let image = SVGKImage(parsedSVG: parseResults, from: svgkSourceNSData), image.hasSize() {
+                    if image.size.width > 1000 || image.size.height > 1000 {
+                        return UIImage(systemSymbol: .exclamationmarkTriangle).withTintColor(.orange)
+                    }
                     return image.uiImage
                 } else {
-                    return UIImage(named: "error.png")
+                    return UIImage(systemSymbol: .exclamationmarkTriangle).withTintColor(.orange)
                 }
             default:
                 return Kingfisher.DefaultImageProcessor().process(item: item, options: KingfisherParsedOptionsInfo(KingfisherManager.shared.defaultOptions))
@@ -79,7 +83,6 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
     private var filteredPage: OpenHABSitemapPage?
     private var serverProperties: OpenHABServerProperties?
     private let search = UISearchController(searchResultsController: nil)
-    private var webViewController: OpenHABWebViewController?
     private var isUserInteracting = false
     private var isWaitingToReload = false
 
@@ -164,6 +167,24 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
         if idleOff {
             UIApplication.shared.isIdleTimerDisabled = true
         }
+
+        NetworkTracker.shared.$status
+            .receive(on: DispatchQueue.main)
+            .sink { status in
+                os_log("OpenHABViewController tracker status %{PUBLIC}@", log: .viewCycle, type: .info, status.rawValue)
+                switch status {
+                case .connecting:
+                    self.showPopupMessage(seconds: 1.5, title: NSLocalizedString("connecting", comment: ""), message: "", theme: .info)
+                case .connectionFailed:
+                    os_log("Tracking error", log: .viewCycle, type: .info)
+                    self.showPopupMessage(seconds: 60, title: NSLocalizedString("error", comment: ""), message: NSLocalizedString("network_not_available", comment: ""), theme: .error)
+                case _:
+                    break
+                }
+            }
+            .store(in: &trackerCancellables)
+
+        var activeServerWatcher = NetworkTracker.shared.$activeServer.eraseToAnyPublisher()
         // if pageUrl == "" it means we are the first opened OpenHABSitemapViewController
         if pageUrl == "" {
             // Set self as root view controller
@@ -173,9 +194,9 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
                 widgetTableView.reloadData()
             }
             os_log("OpenHABSitemapViewController pageUrl is empty, this is first launch", log: .viewCycle, type: .info)
-            OpenHABTracker.shared.multicastDelegate.add(self)
-            OpenHABTracker.shared.restart()
         } else {
+            // we only want to our watcher to notify us about changes, and not the inital value
+            activeServerWatcher = activeServerWatcher.dropFirst().eraseToAnyPublisher()
             if !pageNetworkStatusChanged() {
                 os_log("OpenHABSitemapViewController pageUrl = %{PUBLIC}@", log: .notifications, type: .info, pageUrl)
                 loadPage(false)
@@ -184,6 +205,18 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
                 restart()
             }
         }
+        // listen for network changes, if stateWatcher.dropFirst() was NOT called, then this will exectue imediately with current values and then again if the network changes, otherwise it will be called on changes only.
+        activeServerWatcher
+            .receive(on: DispatchQueue.main)
+            .sink { activeServer in
+                if let activeServer {
+                    os_log("OpenHABSitemapViewController tracker URL %{PUBLIC}@", log: .viewCycle, type: .info, activeServer.url)
+                    self.openHABRootUrl = activeServer.url
+                    self.selectSitemap()
+                }
+            }
+            .store(in: &trackerCancellables)
+
         ImageDownloader.default.authenticationChallengeResponder = self
     }
 
@@ -193,7 +226,9 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
             currentPageOperation?.cancel()
             currentPageOperation = nil
         }
-        OpenHABTracker.shared.multicastDelegate.remove(self)
+
+        trackerCancellables.removeAll()
+
         super.viewWillDisappear(animated)
 
         if #unavailable(iOS 13.0) {
@@ -341,7 +376,7 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
                         return sitemapPageCodingData.openHABSitemapPage
                     }()
                 } catch {
-                    //Printing the error is the only way to actually get the real issue, localizedDescription is pretty useless here
+                    // Printing the error is the only way to actually get the real issue, localizedDescription is pretty useless here
                     print(error)
                     os_log("Should not throw %{PUBLIC}@", log: OSLog.remoteAccess, type: .error, error.localizedDescription)
                     DispatchQueue.main.async {
@@ -438,6 +473,27 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
         }
     }
 
+    // This is mainly used for navigting to a specific sitemap and path from notifications
+    func pushSitemap(name: String, path: String?) {
+        // this will be called imediately after connecting for the initial state, otherwise it will wait for the state to change
+        // since we do not reference the sink cancelable, this will only fire once
+        _ = NetworkTracker.shared.$activeServer
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] activeServer in
+                if let openHABUrl = activeServer?.url, let self {
+                    os_log("pushSitemap: pushing page", log: .default, type: .error)
+                    let newViewController = (storyboard?.instantiateViewController(withIdentifier: "OpenHABPageViewController") as? OpenHABSitemapViewController)!
+                    if let path {
+                        newViewController.pageUrl = "\(openHABUrl)/rest/sitemaps/\(name)/\(path)"
+                    } else {
+                        newViewController.pageUrl = "\(openHABUrl)/rest/sitemaps/\(name)"
+                    }
+                    newViewController.openHABRootUrl = openHABUrl
+                    navigationController?.pushViewController(newViewController, animated: true)
+                }
+            }
+    }
+
     // load app settings
     func loadSettings() {
         openHABUsername = Preferences.username
@@ -518,37 +574,6 @@ class OpenHABSitemapViewController: OpenHABViewController, GenericUITableViewCel
 
     override func viewName() -> String {
         "sitemap"
-    }
-}
-
-// MARK: - OpenHABTrackerDelegate
-
-extension OpenHABSitemapViewController: OpenHABTrackerDelegate {
-    func openHABTracked(_ openHABUrl: URL?, version: Int) {
-        os_log("OpenHABSitemapViewController openHAB URL =  %{PUBLIC}@", log: .remoteAccess, type: .error, "\(openHABUrl!)")
-        openHABRootUrl = openHABUrl?.absoluteString ?? ""
-        selectSitemap()
-    }
-
-    func openHABTrackingProgress(_ message: String?) {
-        os_log("OpenHABSitemapViewController %{PUBLIC}@", log: .viewCycle, type: .info, message ?? "")
-        showPopupMessage(seconds: 1.5, title: NSLocalizedString("connecting", comment: ""), message: message ?? "", theme: .info)
-    }
-
-    func openHABTrackingError(_ error: Error) {
-        os_log("Tracking error: %{PUBLIC}@", log: .viewCycle, type: .info, error.localizedDescription)
-        showPopupMessage(seconds: 60, title: NSLocalizedString("error", comment: ""), message: error.localizedDescription, theme: .error)
-    }
-}
-
-// MARK: - OpenHABSelectionTableViewControllerDelegate
-
-extension OpenHABSitemapViewController: OpenHABSelectionTableViewControllerDelegate {
-    // send command on selected selection widget mapping
-    func didSelectWidgetMapping(_ selectedMappingIndex: Int) {
-        let selectedWidget: OpenHABWidget? = relevantPage?.widgets[selectedWidgetRow]
-        let selectedMapping: OpenHABWidgetMapping? = selectedWidget?.mappingsOrItemOptions[selectedMappingIndex]
-        sendCommand(selectedWidget?.item, commandToSend: selectedMapping?.command)
     }
 }
 
@@ -694,10 +719,9 @@ extension OpenHABSitemapViewController: UITableViewDelegate, UITableViewDataSour
                         os_log("Job failed: %{PUBLIC}@", log: .viewCycle, type: .info, error.localizedDescription)
                     }
                 }
-
                 cell.imageView?.kf.setImage(
                     with: KF.ImageResource(downloadURL: urlc, cacheKey: urlc.path + (urlc.query ?? "")),
-                    placeholder: UIImage(named: "blankicon.png"),
+                    placeholder: nil,
                     options: [.processor(OpenHABImageProcessor())],
                     completionHandler: reportOnResults
                 )
@@ -745,6 +769,7 @@ extension OpenHABSitemapViewController: UITableViewDelegate, UITableViewDataSour
             if let link = widget?.linkedPage?.link {
                 os_log("Selected %{PUBLIC}@", log: .viewCycle, type: .info, link)
             }
+
             selectedWidgetRow = indexPath.row
             let newViewController = (storyboard?.instantiateViewController(withIdentifier: "OpenHABPageViewController") as? OpenHABSitemapViewController)!
             newViewController.title = widget?.linkedPage?.title.components(separatedBy: "[")[0]
@@ -753,15 +778,23 @@ extension OpenHABSitemapViewController: UITableViewDelegate, UITableViewDataSour
             navigationController?.pushViewController(newViewController, animated: true)
         } else if widget?.type == .selection {
             os_log("Selected selection widget", log: .viewCycle, type: .info)
-
             selectedWidgetRow = indexPath.row
-            let selectionViewController = (storyboard?.instantiateViewController(withIdentifier: "OpenHABSelectionTableViewController") as? OpenHABSelectionTableViewController)!
             let selectedWidget: OpenHABWidget? = relevantWidget(indexPath: indexPath)
-            selectionViewController.title = selectedWidget?.labelText
-            selectionViewController.mappings = selectedWidget?.mappingsOrItemOptions ?? []
-            selectionViewController.delegate = self
-            selectionViewController.selectionItem = selectedWidget?.item
-            navigationController?.pushViewController(selectionViewController, animated: true)
+            let hostingController = UIHostingController(rootView: SelectionView(
+                mappings: selectedWidget?.mappingsOrItemOptions ?? [],
+                selectionItem:
+                Binding(
+                    get: { selectedWidget?.item },
+                    set: { selectedWidget?.item = $0 }
+                ),
+                onSelection: { selectedMappingIndex in
+                    let selectedWidget: OpenHABWidget? = self.relevantPage?.widgets[self.selectedWidgetRow]
+                    let selectedMapping: OpenHABWidgetMapping? = selectedWidget?.mappingsOrItemOptions[selectedMappingIndex]
+                    self.sendCommand(selectedWidget?.item, commandToSend: selectedMapping?.command)
+                }
+            ))
+            hostingController.title = widget?.labelText
+            navigationController?.pushViewController(hostingController, animated: true)
         }
         if let index = widgetTableView.indexPathForSelectedRow {
             widgetTableView.deselectRow(at: index, animated: false)
