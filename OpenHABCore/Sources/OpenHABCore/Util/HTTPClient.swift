@@ -46,8 +46,8 @@ public class HTTPClient: NSObject {
      - response: The URL response object providing response metadata, such as HTTP headers and status code.
      - error: An error object that indicates why the request failed, or `nil` if the request was successful.
      */
-    public func doGet(baseURLs: [String], path: String?, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
-        doRequest(baseURLs: baseURLs, path: path, method: "GET") { result, response, error in
+    public func doGet(baseURL: URL, path: String?, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
+        doRequest(baseURL: baseURL, path: path, method: "GET") { result, response, error in
             let data = result as? Data
             completion(data, response, error)
         }
@@ -67,8 +67,8 @@ public class HTTPClient: NSObject {
      - response: The URL response object providing response metadata, such as HTTP headers and status code.
      - error: An error object that indicates why the request failed, or `nil` if the request was successful.
      */
-    public func doPost(baseURLs: [String], path: String?, body: String, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
-        doRequest(baseURLs: baseURLs, path: path, method: "POST", body: body) { result, response, error in
+    public func doPost(baseURL: URL, path: String?, body: String, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
+        doRequest(baseURL: baseURL, path: path, method: "POST", body: body) { result, response, error in
             let data = result as? Data
             completion(data, response, error)
         }
@@ -88,13 +88,28 @@ public class HTTPClient: NSObject {
      - response: The URL response object providing response metadata, such as HTTP headers and status code.
      - error: An error object that indicates why the request failed, or `nil` if the request was successful.
      */
-    public func doPut(baseURLs: [String], path: String?, body: String, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
-        doRequest(baseURLs: baseURLs, path: path, method: "PUT", body: body) { result, response, error in
+    public func doPut(baseURL: URL, path: String?, body: String, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
+        doRequest(baseURL: baseURL, path: path, method: "PUT", body: body) { result, response, error in
             let data = result as? Data
             completion(data, response, error)
         }
     }
 
+   
+    public func getRoot(baseURL: URL, completion: @escaping (Data?, Error?) -> Void) {
+        doGet(baseURL: baseURL, path: "/rest") { data, _, error in
+            if let error {
+                completion(nil, error)
+            } else {
+                if let data {
+                    completion(data, nil)
+                } else {
+                    completion(nil, NSError(domain: "HTTPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "No data"]))
+                }
+            }
+        }
+    }
+    
     /**
      Fetches a list of OpenHAB items from multiple base URLs and returns the items via a completion handler.
 
@@ -106,8 +121,8 @@ public class HTTPClient: NSObject {
      - items: An array of `OpenHABItem` objects returned by the server. This will be `nil` if the request fails.
      - error: An error object that indicates why the request failed, or `nil` if the request was successful.
      */
-    public func getItems(baseURLs: [String], completion: @escaping ([OpenHABItem]?, Error?) -> Void) {
-        doGet(baseURLs: baseURLs, path: "/rest/items") { data, _, error in
+    public func getItems(baseURL: URL, completion: @escaping ([OpenHABItem]?, Error?) -> Void) {
+        doGet(baseURL: baseURL, path: "/rest/items") { data, _, error in
             if let error {
                 completion(nil, error)
             } else {
@@ -145,9 +160,9 @@ public class HTTPClient: NSObject {
      - item: An `OpenHABItem` object returned by the server. This will be `nil` if the request fails.
      - error: An error object that indicates why the request failed, or `nil` if the request was successful.
      */
-    public func getItem(baseURLs: [String], itemName: String, completion: @escaping (OpenHABItem?, Error?) -> Void) {
-        os_log("getItem from URsL %{public}@ and item %{public}@", log: .networking, type: .info, baseURLs, itemName)
-        doGet(baseURLs: baseURLs, path: "/rest/items/\(itemName)") { data, _, error in
+    public func getItem(baseURL: URL, itemName: String, completion: @escaping (OpenHABItem?, Error?) -> Void) {
+        os_log("getItem from URL %{public}@ and item %{public}@", log: .networking, type: .info, baseURL.absoluteString, itemName)
+        doGet(baseURL: baseURL, path: "/rest/items/\(itemName)") { data, _, error in
             if let error {
                 completion(nil, error)
             } else {
@@ -181,27 +196,8 @@ public class HTTPClient: NSObject {
      - response: The URL response object providing response metadata, such as HTTP headers and status code.
      - error: An error object that indicates why the request failed, or `nil` if the request was successful.
      */
-    public func downloadFile(baseURLs: [String], path: String, completionHandler: @escaping @Sendable (URL?, URLResponse?, (any Error)?) -> Void) {
-        doRequest(baseURLs: baseURLs, path: path, method: "GET", download: true) { result, response, error in
-            let fileURL = result as? URL
-            completionHandler(fileURL, response, error)
-        }
-    }
-
-    /**
-     Initiates a download request to a specified URL and returns the file URL via a completion handler.
-
-     This function sends a GET request to the provided URL to download a file. If the request fails (due to network issues or HTTP error codes between 400 and 599), it will automatically attempt the request again until a successful download occurs.
-
-     - Parameters:
-     - url: The URL string to download the file from.
-     - completionHandler: A closure to be executed once the download is complete. The closure takes three parameters:
-     - fileURL: The local URL where the downloaded file is stored. This will be `nil` if the download fails.
-     - response: The URL response object providing response metadata, such as HTTP headers and status code.
-     - error: An error object that indicates why the request failed, or `nil` if the request was successful.
-     */
-    public func downloadFile(url: String, completionHandler: @escaping @Sendable (URL?, URLResponse?, (any Error)?) -> Void) {
-        doRequest(baseURLs: [url], path: nil, method: "GET", download: true) { result, response, error in
+    public func downloadFile(baseURL: URL, path: String?, completionHandler: @escaping @Sendable (URL?, URLResponse?, (any Error)?) -> Void) {
+        doRequest(baseURL: baseURL, path: path, method: "GET", download: true) { result, response, error in
             let fileURL = result as? URL
             completionHandler(fileURL, response, error)
         }
@@ -215,53 +211,41 @@ public class HTTPClient: NSObject {
         return "Basic \(authData.base64EncodedString())"
     }
 
-    private func doRequest(baseURLs: [String], path: String?, method: String, body: String? = nil, download: Bool = false, completion: @escaping (Any?, URLResponse?, Error?) -> Void) {
-        var urls: [URL] = []
-        for urlString in baseURLs {
-            if var urlComponent = URLComponents(string: urlString) {
-                if let path {
-                    urlComponent.path = path
-                }
-                if let url = urlComponent.url {
-                    urls.append(url)
+    private func doRequest(baseURL: URL, path: String?, method: String, body: String? = nil, download: Bool = false, completion: @escaping (Any?, URLResponse?, Error?) -> Void) {
+        var url = baseURL
+        if let path {
+            url = url.appendingPathComponent(path)
+        }
+
+//        guard let url = urlComponent?.url else {
+//            os_log("Invalid URL: %{public}@", log: .networking, type: .error, baseURL)
+//            completion(nil, nil, NSError(domain: "HTTPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"]))
+//            return
+//        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        if let body {
+            request.httpBody = body.data(using: .utf8)
+            request.setValue("text/plain", forHTTPHeaderField: "Content-Type")
+        }
+
+        performRequest(request: request, download: download) { result, response, error in
+            if let error {
+                os_log("Error with URL %{public}@ : %{public}@", log: .networking, type: .error, url.absoluteString, error.localizedDescription)
+                completion(result, response, error)
+            } else if let response = response as? HTTPURLResponse {
+                if (400 ... 599).contains(response.statusCode) {
+                    os_log("HTTP error from URL %{public}@ : %{public}d", log: .networking, type: .error, url.absoluteString, response.statusCode)
+                    completion(result, response, NSError(domain: "HTTPClient", code: response.statusCode, userInfo: [NSLocalizedDescriptionKey: "HTTP error"]))
+                } else {
+                    os_log("Response from URL %{public}@ : %{public}d", log: .networking, type: .info, url.absoluteString, response.statusCode)
+                    completion(result, response, nil)
                 }
             }
         }
-
-        func sendRequest() {
-            guard !urls.isEmpty else {
-                os_log("All URLs processed and failed.", log: .networking, type: .error)
-                completion(nil, nil, NSError(domain: "HTTPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "All URLs processed and failed."]))
-                return
-            }
-
-            let url = urls.removeFirst()
-            var request = URLRequest(url: url)
-            request.httpMethod = method
-            if let body {
-                request.httpBody = body.data(using: .utf8)
-                request.setValue("text/plain", forHTTPHeaderField: "Content-Type")
-            }
-            performRequest(request: request, download: download) { result, response, error in
-                if let error {
-                    os_log("Error with URL %{public}@ : %{public}@", log: .networking, type: .error, url.absoluteString, error.localizedDescription)
-                    // Try the next URL
-                    sendRequest()
-                } else if let response = response as? HTTPURLResponse {
-                    if (400 ... 599).contains(response.statusCode) {
-                        os_log("HTTP error from URL %{public}@ : %{public}d", log: .networking, type: .error, url.absoluteString, response.statusCode)
-                        // Try the next URL
-                        sendRequest()
-                    } else {
-                        os_log("Response from URL %{public}@ : %{public}d", log: .networking, type: .info, url.absoluteString, response.statusCode)
-                        completion(result, response, nil)
-                    }
-                }
-            }
-        }
-        sendRequest()
     }
-
+    
     private func performRequest(request: URLRequest, download: Bool, completion: @escaping (Any?, URLResponse?, Error?) -> Void) {
         var request = request
         if alwaysSendBasicAuth {

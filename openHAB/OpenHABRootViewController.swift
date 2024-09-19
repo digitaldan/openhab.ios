@@ -341,14 +341,15 @@ class OpenHABRootViewController: UIViewController {
         if components.count == 2 {
             let itemName = String(components[0])
             let itemCommand = String(components[1])
-            // This will only fire onece since we do not retain the return cancelable
-            _ = NetworkTracker.shared.$activeServer
+            NetworkTracker.shared.$activeServer
+                .filter { $0 != nil } // Only proceed if activeServer is not nil
+                .first() // Automatically cancels after the first non-nil value
                 .receive(on: DispatchQueue.main)
                 .sink { activeServer in
-                    if let openHABUrl = activeServer?.url {
+                    if let openHABUrl = activeServer?.url, let url =  URL(string: openHABUrl) {
                         os_log("Sending comand", log: .default, type: .error)
                         let client = HTTPClient(username: Preferences.username, password: Preferences.password)
-                        client.doPost(baseURLs: [openHABUrl], path: "/rest/items/\(itemName)", body: itemCommand) { data, _, error in
+                        client.doPost(baseURL: url, path: "/rest/items/\(itemName)", body: itemCommand) { data, _, error in
                             if let error {
                                 os_log("Could not send data %{public}@", log: .default, type: .error, error.localizedDescription)
                             } else {
@@ -360,6 +361,7 @@ class OpenHABRootViewController: UIViewController {
                         }
                     }
                 }
+                .store(in: &cancellables)
         }
     }
 
@@ -417,14 +419,15 @@ class OpenHABRootViewController: UIViewController {
             // nothing
         }
 
-        // This will only fire onece since we do not retain the return cancelable
-        _ = NetworkTracker.shared.$activeServer
+        NetworkTracker.shared.$activeServer
+            .filter { $0 != nil } // Only proceed if activeServer is not nil
+            .first() // Automatically cancels after the first non-nil value
             .receive(on: DispatchQueue.main)
             .sink { activeServer in
-                if let openHABUrl = activeServer?.url {
+                if let openHABUrl = activeServer?.url, let url = URL(string: openHABUrl) {
                     os_log("Sending comand", log: .default, type: .error)
                     let client = HTTPClient(username: Preferences.username, password: Preferences.password)
-                    client.doPost(baseURLs: [openHABUrl], path: "/rest/rules/rules/\(uuid)/runnow", body: jsonString) { data, _, error in
+                    client.doPost(baseURL: url, path: "/rest/rules/rules/\(uuid)/runnow", body: jsonString) { data, _, error in
                         if let error {
                             os_log("Could not send data %{public}@", log: .default, type: .error, error.localizedDescription)
                         } else {
@@ -436,6 +439,7 @@ class OpenHABRootViewController: UIViewController {
                     }
                 }
             }
+            .store(in: &cancellables)
     }
 
     func showSideMenu() {
