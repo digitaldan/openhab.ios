@@ -46,6 +46,27 @@ public enum StateStreamMessage: Sendable, Equatable {
     case unknown(raw: String)
 }
 
+private actor TimeoutMonitor {
+    let timeout: TimeInterval
+    private var lastMessageTime = Date()
+
+    init(_ timeout: TimeInterval) {
+        self.timeout = timeout
+    }
+
+    func updateLastMessageTime() {
+        lastMessageTime = Date()
+    }
+
+    func checkTimeout() throws {
+        if Date().timeIntervalSince(lastMessageTime) > timeout {
+            throw NSError(domain: "EventStreamTimeout", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "No messages received within \(timeout) seconds"
+            ])
+        }
+    }
+}
+
 public actor EventStream<Event: Sendable> {
     // Alive and Item State Chnage message structures
     private struct Alive: Decodable { let type: String; let interval: Int }
@@ -134,13 +155,28 @@ public actor EventStream<Event: Sendable> {
 
         while !Task.isCancelled {
             do {
+                Logger.restAPI.debug("Opening new state tracking SSE connection")
                 let service = try OpenAPIService(connectionConfiguration: config)
                 let response = try await service.initNewStateTacker()
                 let eventStream = try response.ok.body.text_event_hyphen_stream.asDecodedServerSentEvents()
                 self.service = service
                 broadcast(.connected)
 
+                let timeoutMonitor = TimeoutMonitor(30.0)
+
+                // Start a background task to monitor timeout, will throw an exception if a timeout occur, checkTimeout will throw an exception if a timeour occurs, which we catch and initiate the reconnect logic like any other SSE error.
+                let timeoutTask = Task {
+                    while !Task.isCancelled {
+                        try await Task.sleep(for: .seconds(5)) // Check every 5 seconds
+                        try await timeoutMonitor.checkTimeout() // throws exception on timeout
+                    }
+                }
+
+                defer { timeoutTask.cancel() }
+                Logger.restAPI.debug("Listening for state updates")
                 for try await sse in eventStream {
+                    await timeoutMonitor.updateLastMessageTime() // Reset timeout on each message
+
                     for rawMessage in parse(sse) {
                         if let message = rawMessage as? Event {
                             broadcast(.event(message))
