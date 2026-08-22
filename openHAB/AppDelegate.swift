@@ -18,14 +18,11 @@ import Kingfisher
 import OpenHABCore
 import os.log
 import SDWebImageSVGCoder
-import SwiftMessages
 import UIKit
 @preconcurrency import UserNotifications
 import WatchConnectivity
 
-@main
 class AppDelegate: UIResponder, UIApplicationDelegate {
-    static var appDelegate: AppDelegate!
 
     private var crashlyticsSubscriber: AnyCancellable?
 
@@ -48,7 +45,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     override init() {
         super.init()
-        AppDelegate.appDelegate = self
     }
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
@@ -233,6 +229,13 @@ extension Notification.Name {
 }
 
 extension AppDelegate {
+    func applicationWillResignActive(_ application: UIApplication) {
+        // Dismiss the screensaver overlay and restore brightness before the app leaves the
+        // foreground (Control Center, an incoming call, the app switcher, backgrounding, etc.),
+        // rather than leaving that cleanup to happen reactively on the next touch.
+        NotificationCenter.default.post(name: .disableScreenSaver, object: nil)
+    }
+
     func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
         switch connectingSceneSession.role {
         case .carTemplateApplication:
@@ -242,11 +245,18 @@ extension AppDelegate {
         }
     }
 
-    func applicationDidEnterBackground(_ application: UIApplication) {}
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
+        // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
+    }
 
-    func applicationWillEnterForeground(_ application: UIApplication) {}
+    func applicationWillEnterForeground(_ application: UIApplication) {
+        // Called as part of the transition from the background to the inactive state; here you can undo many of the changes made on entering the background.
+    }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
+        NotificationCenter.default.post(name: .appDidBecomeActive, object: nil)
+        // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
         if let keyWindow = UIApplication.shared.firstKeyWindow {
             var config = ScreenSaverConfiguration()
             config.isEnabled = Preferences.shared.screensaverEnabled
@@ -272,7 +282,9 @@ extension AppDelegate {
         }
     }
 
-    func applicationWillTerminate(_ application: UIApplication) {}
+    func applicationWillTerminate(_ application: UIApplication) {
+        // Called when the application is about to terminate. Save data if appropriate. See also applicationDidEnterBackground:.
+    }
 
     func application(_ application: UIApplication, didDiscardSceneSessions sceneSessions: Set<UISceneSession>) {}
 }

@@ -18,7 +18,6 @@ import OpenHABCore
 /// (ON/OFF, OPEN/CLOSED, player commands) are displayed in the user's
 /// language inside Shortcuts dialogs, while numeric or custom states
 /// pass through unchanged.
-@available(iOS 17.0, macOS 14.0, *)
 private struct LocalizedItemState: CustomLocalizedStringResourceConvertible {
     let rawValue: String
 

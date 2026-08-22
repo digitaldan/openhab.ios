@@ -16,9 +16,9 @@ import SwiftUI
 
 struct SitemapSettingsView: View {
     @Binding var settingsRealTimeSliders: Bool
-    @Binding var settingsShowSearchField: Bool
     @Binding var settingsIconType: IconType
     @Binding var settingsSortSitemapsBy: SortSitemapsOrder
+    @Binding var settingsSitemapNameLabelDisplayMode: SitemapNameLabelDisplayMode
     @Binding var settingsSitemapForWatch: String
     @Binding var settingsSitemapForCarPlay: String
     @Binding var sitemaps: [OpenHABSitemap]
@@ -29,9 +29,9 @@ struct SitemapSettingsView: View {
     var body: some View {
         Section(header: Text(LocalizedStringKey("sitemap_settings"))) {
             realtimeSliderToggle
-            searchFieldToggle
             cacheButton
             iconTypePicker
+            displayModePicker
             sortOrderPicker
             watchSitemapPicker
             carPlaySitemapPicker
@@ -41,12 +41,6 @@ struct SitemapSettingsView: View {
     private var realtimeSliderToggle: some View {
         Toggle(isOn: $settingsRealTimeSliders) {
             Text("Real-time Sliders")
-        }
-    }
-
-    private var searchFieldToggle: some View {
-        Toggle(isOn: $settingsShowSearchField) {
-            Text("Show Search Field")
         }
     }
 
@@ -81,6 +75,18 @@ struct SitemapSettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private var displayModePicker: some View {
+        Picker(selection: $settingsSitemapNameLabelDisplayMode) {
+            ForEach(SitemapNameLabelDisplayMode.allCases) { mode in
+                Text(verbatim: "\(mode)").tag(mode)
+            }
+        } label: {
+            Text("Show sitemaps by")
+        }
+    }
+
+    @ViewBuilder
     private var sortOrderPicker: some View {
         Picker(selection: $settingsSortSitemapsBy) {
             ForEach(SortSitemapsOrder.allCases, id: \.self) { sortsitemaporder in
@@ -94,10 +100,19 @@ struct SitemapSettingsView: View {
     private var watchSitemapPicker: some View {
         Picker("Sitemap for Apple Watch", selection: $settingsSitemapForWatch) {
             if sitemaps.isEmpty {
-                Text("No sitemaps available").tag("").foregroundStyle(.secondary)
+                // Tag the placeholder with the stored selection so the Picker has a
+                // matching tag (avoids the "invalid selection" warning while the
+                // sitemap list is still loading).
+                Text("No sitemaps available").tag(settingsSitemapForWatch).foregroundStyle(.secondary)
             } else {
                 ForEach(sitemaps, id: \.name) { sitemap in
-                    Text(sitemap.label).tag(sitemap.name)
+                    Text(settingsSitemapNameLabelDisplayMode.combinedText(for: sitemap, sortedBy: settingsSortSitemapsBy)).tag(sitemap.name)
+                }
+                if !sitemaps.contains(where: { $0.name == settingsSitemapForWatch }) {
+                    // The stored selection isn't among the available sitemaps (e.g. a
+                    // renamed/removed sitemap, or the default before one is chosen);
+                    // surface it so the Picker always has a tag for its selection.
+                    Text(settingsSitemapForWatch).tag(settingsSitemapForWatch).foregroundStyle(.secondary)
                 }
             }
         }
@@ -109,7 +124,7 @@ struct SitemapSettingsView: View {
             Text("None").tag("")
             if !sitemaps.isEmpty {
                 ForEach(sitemaps, id: \.name) { sitemap in
-                    Text(sitemap.label).tag(sitemap.name)
+                    Text(settingsSitemapNameLabelDisplayMode.combinedText(for: sitemap, sortedBy: settingsSortSitemapsBy)).tag(sitemap.name)
                 }
             }
         }
@@ -152,9 +167,9 @@ struct SitemapSettingsView: View {
 #Preview {
     struct PreviewWrapper: View {
         @State var realTimeSliders = true
-        @State var showSearchField = true
         @State var iconType: IconType = .svg
         @State var sortSitemapsBy: SortSitemapsOrder = .label
+        @State var sitemapNameLabelDisplayMode: SitemapNameLabelDisplayMode = .label
         @State var sitemapForWatch = "Home"
         @State var sitemapForCarPlay = ""
         @State var sitemaps: [OpenHABSitemap] = [
@@ -178,9 +193,9 @@ struct SitemapSettingsView: View {
                 Form {
                     SitemapSettingsView(
                         settingsRealTimeSliders: $realTimeSliders,
-                        settingsShowSearchField: $showSearchField,
                         settingsIconType: $iconType,
                         settingsSortSitemapsBy: $sortSitemapsBy,
+                        settingsSitemapNameLabelDisplayMode: $sitemapNameLabelDisplayMode,
                         settingsSitemapForWatch: $sitemapForWatch,
                         settingsSitemapForCarPlay: $sitemapForCarPlay,
                         sitemaps: $sitemaps

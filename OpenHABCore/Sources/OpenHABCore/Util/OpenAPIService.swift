@@ -27,6 +27,13 @@ public enum OpenAPIServiceConfiguration {
     case asDefault
     case shortTerm
     case longTerm
+    /// For persistent SSE connections expected to stay open indefinitely. iOS's
+    /// per-request timeout does not reliably reset on each chunk of a streamed
+    /// response, so it must be set well beyond the server's ALIVE ping interval
+    /// (~10s) to avoid spurious disconnects while the stream is still healthy.
+    /// A genuinely dead connection is instead caught by the caller's own
+    /// idle-event watchdog.
+    case sse
 }
 
 public protocol OpenAPIServiceProtocol: AnyObject, Sendable {
@@ -82,6 +89,13 @@ public actor OpenAPIService {
         case .shortTerm:
             config.timeoutIntervalForRequest = 10.0
             config.timeoutIntervalForResource = 10.0
+        case .sse:
+            config.requestCachePolicy = .reloadIgnoringLocalCacheData
+            config.urlCache = nil
+            config.timeoutIntervalForRequest = 300.0
+            // Leave timeoutIntervalForResource at its default (7 days) — the stream
+            // is meant to stay open indefinitely; a dead connection is caught by
+            // the caller's own idle-event watchdog, not by a resource-lifetime cap.
         }
         let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
         urlSession = session
@@ -167,6 +181,51 @@ public extension OpenAPIService {
         try await client.getUITiles(.init())
             .ok.body.json
             .map(OpenHABUiTile.init)
+    }
+
+    func getUIPages(rootUrl: String) async throws -> [OpenHABUIPage] {
+        guard let base = url else { throw OpenAPIServiceError.noRootURL }
+        let endpoint = base.appending(path: "/rest/ui/components/ui:page")
+        var request = URLRequest(url: endpoint)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if !connectionConfiguration.username.isEmpty {
+            request.setValue(
+                basicAuthHeader(username: connectionConfiguration.username, password: connectionConfiguration.password),
+                forHTTPHeaderField: "Authorization"
+            )
+        }
+        // urlSession is optional since the develop merge (retained for deinit teardown); a configured
+        // service always has one — guard rather than fall back to .shared so we don't leak a session.
+        guard let urlSession else { throw URLError(.badURL) }
+        let (data, _) = try await urlSession.data(for: request)
+
+        struct UIPageDTO: Decodable {
+            var uid: String?
+            var config: Config?
+            struct Config: Decodable {
+                var label: String?
+                var icon: String?
+                var order: String?
+                var sidebar: Bool?
+            }
+        }
+
+        return try JSONDecoder()
+            .decode([UIPageDTO].self, from: data)
+            .compactMap { dto -> OpenHABUIPage? in
+                guard let uid = dto.uid, !uid.isEmpty,
+                      dto.config?.sidebar == true
+                else { return nil }
+                let label = dto.config?.label ?? uid
+                let icon = dto.config?.icon ?? ""
+                let order = dto.config?.order.flatMap(Int.init) ?? Int.max
+                // The Main UI SPA uses Framework7 history mode (pushState).
+                // browser-history-root is set to the server origin, so routes resolve
+                // as {rootUrl}/page/{uid} — no /ui/ prefix, no hash fragment.
+                let url = "\(rootUrl.removeTrailingSlashes())/page/\(uid)"
+                return OpenHABUIPage(uid: uid, label: label, icon: icon, order: order, url: url)
+            }
+            .sorted { $0.order < $1.order }
     }
 }
 

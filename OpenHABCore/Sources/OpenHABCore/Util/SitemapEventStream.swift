@@ -39,7 +39,7 @@ public actor SitemapEventStream {
     private let makeService: @Sendable (ConnectionConfiguration) throws -> any OpenAPIServiceProtocol
 
     public init(makeService: @escaping @Sendable (ConnectionConfiguration) throws -> any OpenAPIServiceProtocol = {
-        try OpenAPIService(connectionConfiguration: $0)
+        try OpenAPIService(connectionConfiguration: $0, serviceConfiguration: .sse)
     }) {
         self.makeService = makeService
     }
@@ -91,9 +91,9 @@ public actor SitemapEventStream {
         guard networkMonitoringTask == nil else { return }
 
         networkMonitoringTask = Task { [weak self] in
-            for await conn in await NetworkTracker.shared.activeConnectionStream() {
+            for await state in await NetworkTracker.shared.stateStream() {
                 guard let self else { return }
-                await updateConnection(conn)
+                await updateConnection(state.activeConnection)
             }
         }
     }

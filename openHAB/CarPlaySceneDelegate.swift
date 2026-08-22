@@ -10,6 +10,7 @@
 // SPDX-License-Identifier: EPL-2.0
 
 import CarPlay
+import Combine
 import CommonUI
 import Kingfisher
 import OpenHABCore
@@ -92,7 +93,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     var interfaceController: CPInterfaceController?
     var streamTask: Task<Void, Never>?
     var refreshTask: Task<Void, Never>?
-    var preferencesTask: Task<Void, Never>?
+    var preferencesCancellable: AnyCancellable?
     let sitemapEventStream = SitemapEventStream()
     /// openHAB scopes a subscription per page and the main stream follows the selected
     /// group, so a group's own `Text` widget needs its own.
@@ -172,8 +173,8 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         streamTask = nil
         refreshTask?.cancel()
         refreshTask = nil
-        preferencesTask?.cancel()
-        preferencesTask = nil
+        preferencesCancellable?.cancel()
+        preferencesCancellable = nil
         pendingIconURLs.removeAll()
         rootStreamTask?.cancel()
         rootStreamTask = nil
@@ -232,19 +233,25 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     }
 
     func startObservingPreferences() {
-        preferencesTask?.cancel()
-        preferencesTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var lastSitemap = Preferences.shared.currentHomePreferences.sitemapForCarPlay
-            for await _ in NotificationCenter.default.notifications(named: UserDefaults.didChangeNotification) {
-                guard !Task.isCancelled else { break }
-                let newSitemap = Preferences.shared.currentHomePreferences.sitemapForCarPlay
-                guard newSitemap != lastSitemap else { continue }
+        var lastSitemap = Preferences.shared.currentHomePreferences.sitemapForCarPlay
+        // currentHomePreferencesPublisher is driven by the in-memory @Published preferences
+        // that modifyActiveHome(...) updates synchronously. UserDefaults.didChangeNotification,
+        // used here before, isn't reliably posted for the App Group suite, so CarPlay could
+        // keep streaming a stale sitemap.
+        //
+        // sink rather than .values/for-await: Combine's AsyncPublisher bridge asserts delivery
+        // on the executor captured at subscription and crashes (dispatch_assert_queue) when
+        // delivery lands on the cooperative pool instead.
+        preferencesCancellable = Preferences.shared.currentHomePreferencesPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] prefs in
+                guard let self else { return }
+                let newSitemap = prefs.sitemapForCarPlay
+                guard newSitemap != lastSitemap else { return }
                 lastSitemap = newSitemap
                 // Sitemap selection changed — full restart needed (different page/subscription).
                 startStreaming()
             }
-        }
     }
 
     @MainActor
