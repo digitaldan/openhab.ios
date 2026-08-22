@@ -33,10 +33,13 @@ struct BuiltSections {
 }
 
 /// The pushed detail screen, kept live by incoming state.
+/// Holds a widget id, not a widget: a page refresh replaces every `OpenHABWidget`, and a
+/// retained one would report — and act on — the state it had when the screen opened.
 enum CarPlayDetail {
-    case stepper(CPInformationTemplate, OpenHABWidget)
-    case choice(CPListTemplate, OpenHABWidget, [OpenHABWidgetMapping])
+    case stepper(CPInformationTemplate, String)
+    case choice(CPListTemplate, String, [OpenHABWidgetMapping])
 
+    /// Press/release declared on the widget rather than in a mapping.
     var template: CPTemplate {
         switch self {
         case let .stepper(template, _): template
@@ -130,8 +133,21 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     var pendingIconURLs: Set<String> = []
     /// Keyed by icon URL so re-renders resolve synchronously.
     var iconCache: [String: UIImage] = [:]
+    /// Artwork the current page needs; exempt from eviction.
+    var activeIconKeys: Set<String> = []
     /// Eviction order: state-dependent URLs mint an entry per dimmer level.
     var iconCacheOrder: [String] = []
+
+    static func widgetLevelMapping(for widget: OpenHABWidget) -> OpenHABWidgetMapping? {
+        let press = widget.releaseOnly == true ? nil : widget.command
+        let release = widget.releaseCommand
+        guard press?.isEmpty == false || release?.isEmpty == false else { return nil }
+        return OpenHABWidgetMapping(
+            command: press,
+            label: widget.displayState.labelText,
+            releaseCommand: release
+        )
+    }
 
     /// Backoff capped at 30s so repeated failures stop hammering a dead network.
     static func retryDelay(failures: Int) -> Int {
@@ -174,6 +190,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         headerButtonTitles.removeAll()
         headerButtonImages.removeAll()
         headerButtonIds.removeAll()
+        subscribedPageId = nil
         renderedItems.removeAll()
         renderedItemKeys.removeAll()
         renderedImageKeys.removeAll()
@@ -184,6 +201,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         currentConnection = nil
         iconCache.removeAll()
         iconCacheOrder.removeAll()
+        activeIconKeys.removeAll()
         sessionConfiguration = nil
         Logger.carPlay.info("CarPlay scene disconnected")
     }
@@ -282,6 +300,17 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
             showUnreachableIfEmpty()
             return .failed
         }
+    }
+
+    /// Finds a widget on the current page or any of its linked pages.
+    @MainActor
+    func widget(withId id: String) -> OpenHABWidget? {
+        guard let page = currentPage else { return nil }
+        if let match = page.widgets.first(where: { $0.widgetId == id }) { return match }
+        for widget in page.widgets {
+            if let match = widget.linkedPage?.widgets.first(where: { $0.widgetId == id }) { return match }
+        }
+        return nil
     }
 
     /// Losing signal mid-drive leaves the last known state visible.
@@ -456,10 +485,12 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         return .notFound
     }
 
-    /// Refreshes without restarting the stream; coalesces rapid events into one fetch.
+    /// Refreshes without restarting the stream. The delay is what actually coalesces:
+    /// cancelling alone lets a steady event rate abort every fetch before it lands.
     func schedulePageRefresh(sitemapName: String) {
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
             guard let self, !Task.isCancelled else { return }
             await refreshPage(sitemapName: sitemapName)
         }
@@ -483,9 +514,10 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         do {
             for try await event in SitemapPageLoader.stream(sitemapName: sitemapName, pageId: pageId, service: service) {
                 guard !Task.isCancelled else { break }
-                if case let .longPoll(page, _) = event {
-                    currentPage = page
-                    updateTemplate(page: page, service: service)
+                // The polled page carries linked pages as childless stubs, so adopting it
+                // would drop every group. Use it only as a signal to refetch the tree.
+                if case .longPoll = event {
+                    schedulePageRefresh(sitemapName: sitemapName)
                 }
             }
         } catch {

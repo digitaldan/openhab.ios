@@ -68,6 +68,7 @@ extension CarPlaySceneDelegate {
             }
         }
 
+        refreshDetailTemplate()
         syncRootStream(groups: groups)
         fetchRemoteIcons(for: candidates + groups.flatMap(\.widgets), page: page, service: service)
     }
@@ -75,27 +76,39 @@ extension CarPlaySceneDelegate {
     /// One section per frame plus unheaded runs for widgets outside any.
     ///
     /// `OpenHABPage` already flattens its tree, so a frame sits alongside the children that
-    /// name it in `parentWidgetId`. Walking into `widget.widgets` too would double them.
+    /// name it in `parentWidgetId`. Walked in order, so a loose widget after a frame stays
+    /// after it rather than being folded into an earlier run.
     func widgetSections(of widgets: [OpenHABWidget]) -> [WidgetSection] {
+        // sitemapVisibleWidgets also hides frames with no visible children, and anything
+        // under a hidden frame — neither of which a per-widget visibility check catches.
+        let visible = sitemapVisibleWidgets(widgets)
         var frameLabels: [String: String] = [:]
-        for frame in widgets where frame.type == .frame {
+        for frame in visible where frame.type == .frame {
             frameLabels[frame.widgetId] = frame.displayState.labelText
         }
 
-        var order: [String] = []
-        var buckets: [String: [OpenHABWidget]] = [:]
+        var sections: [WidgetSection] = []
+        var currentKey: String?
+        var current: [OpenHABWidget] = []
 
-        for widget in widgets where widget.visibility && isCompatible(widget) {
+        func flush() {
+            guard !current.isEmpty else { return }
+            let label = currentKey.flatMap { frameLabels[$0] } ?? ""
+            sections.append(WidgetSection(header: label.isEmpty ? nil : label, widgets: current))
+            current = []
+        }
+
+        for widget in visible where isCompatible(widget) {
             let parent = widget.parentWidgetId ?? ""
             let key = frameLabels[parent] != nil ? parent : ""
-            if buckets[key] == nil { order.append(key) }
-            buckets[key, default: []].append(widget)
+            if key != currentKey {
+                flush()
+                currentKey = key
+            }
+            current.append(widget)
         }
-
-        return order.map { key in
-            let label = frameLabels[key] ?? ""
-            return WidgetSection(header: label.isEmpty ? nil : label, widgets: buckets[key] ?? [])
-        }
+        flush()
+        return sections
     }
 
     /// A `Text` widget wrapping a linked page becomes a group.
@@ -161,7 +174,6 @@ extension CarPlaySceneDelegate {
         let fingerprint = renderFingerprint(for: active, shown: shown)
         guard fingerprint != lastRenderFingerprint else { return }
         lastRenderFingerprint = fingerprint
-        refreshDetailTemplate()
 
         // No fallback header: the button names the group, and a sticky header floats.
         let built = buildSections(active.sections, fallbackHeader: nil, service: service)
@@ -264,7 +276,9 @@ extension CarPlaySceneDelegate {
                 templates.append(existing)
             } else {
                 renderedKeysByGroup[group.id] = built.signature
-                let template = CPListTemplate(title: group.title, sections: built.sections)
+                // name, not title: CPListTemplate.title is immutable, so a live value here
+                // would freeze at whatever it was when the tab was built.
+                let template = CPListTemplate(title: group.name, sections: built.sections)
                 groupTemplates[group.id] = template
                 templates.append(template)
             }
@@ -282,6 +296,8 @@ extension CarPlaySceneDelegate {
 
         if let existing = currentTabBarTemplate {
             existing.updateTemplates(templates)
+            // CarPlay selects the first tab again, and does not call the delegate for it.
+            if let first = shown.first { repointSubscription(to: first.id) }
         } else {
             let tabBar = CPTabBarTemplate(templates: templates)
             tabBar.delegate = self
@@ -351,7 +367,7 @@ extension CarPlaySceneDelegate {
     /// Everything the list draws, compared before any work is done.
     @MainActor
     func renderFingerprint(for active: SitemapGroup, shown: [SitemapGroup]) -> String {
-        var parts: [String] = [active.id]
+        var parts: [String] = [active.id, "\(CPListTemplate.maximumItemCount)"]
         for section in active.sections {
             parts.append("#\(section.header ?? "")")
             for widget in section.widgets {
@@ -475,6 +491,10 @@ extension CarPlaySceneDelegate {
         if let momentary = mappings.first, momentary.hasPressReleaseBehavior {
             return makeChoiceRow(for: widget, mappings: [momentary], service: service)
         }
+        // A sitemap can declare press/release on the widget rather than in a mapping.
+        if let widgetLevel = Self.widgetLevelMapping(for: widget) {
+            return makeChoiceRow(for: widget, mappings: [widgetLevel], service: service)
+        }
         return makeChoiceRow(for: widget, mappings: Self.onOffMappings, service: service)
     }
 
@@ -507,18 +527,6 @@ extension CarPlaySceneDelegate {
 
     // MARK: - Detail screens
 
-    /// One close affordance for every detail screen, in the nav bar rather than the body so
-    /// it never competes with the controls for space.
-    @MainActor
-    func closeButton() -> CPBarButton {
-        let button = CPBarButton(title: String(localized: "Cancel")) { [weak self] _ in
-            self?.detailTemplate = nil
-            self?.interfaceController?.popTemplate(animated: true, completion: nil)
-        }
-        button.buttonStyle = .rounded
-        return button
-    }
-
     /// Choices as a pushed list rather than a sheet: consistent chrome, and room for as many
     /// options as a sitemap defines. Picking one sends it and returns.
     @MainActor
@@ -529,8 +537,7 @@ extension CarPlaySceneDelegate {
             title: widget.displayState.labelText,
             sections: [choiceSection(for: widget, mappings: mappings, service: service)]
         )
-        template.trailingNavigationBarButtons = [closeButton()]
-        detailTemplate = .choice(template, widget, mappings)
+        detailTemplate = .choice(template, widget.widgetId, mappings)
         interfaceController?.pushTemplate(template, animated: true, completion: nil)
     }
 
@@ -566,7 +573,7 @@ extension CarPlaySceneDelegate {
         let step = ds.step.valueText(step: ds.step)
 
         let template = CPInformationTemplate(
-            title: ds.labelText,
+            title: stepperTitle(for: widget),
             layout: .leading,
             items: stepperItems(for: widget),
             actions: [
@@ -578,24 +585,48 @@ extension CarPlaySceneDelegate {
                 }
             ]
         )
-        template.trailingNavigationBarButtons = [closeButton()]
-        detailTemplate = .stepper(template, widget)
+        // Actions cap at 3 and − / + take two, so the switch goes in the nav bar.
+        if ds.switchSupport {
+            template.trailingNavigationBarButtons = Self.onOffMappings.map { mapping in
+                let button = CPBarButton(title: mapping.label) { [weak self] _ in
+                    self?.send(mapping: mapping, for: widget, service: service)
+                }
+                button.buttonStyle = .rounded
+                return button
+            }
+        }
+        detailTemplate = .stepper(template, widget.widgetId)
         interfaceController?.pushTemplate(template, animated: true, completion: nil)
+    }
+
+    /// The nav bar is the only text CarPlay draws large, so the state rides along with the
+    /// label there. A sitemap label pattern like `[%d %%]` already carries it; without one
+    /// we append the value, defaulting sliders to percent.
+    @MainActor
+    func stepperTitle(for widget: OpenHABWidget) -> String {
+        let ds = widget.displayState
+        if let value = ds.labelValue?.trimmingCharacters(in: .whitespaces), !value.isEmpty {
+            return "\(ds.labelText) \(value)"
+        }
+        let unit = widget.unit.map { " \($0)" } ?? (widget.renderingKind == .slider ? "%" : "")
+        return "\(ds.labelText) \(ds.adjustedValue.valueText(step: ds.step))\(unit)"
     }
 
     @MainActor
     func stepperItems(for widget: OpenHABWidget) -> [CPInformationItem] {
-        let ds = widget.displayState
-        return [CPInformationItem(title: ds.labelText, detail: steppedValueText(ds))]
+        [CPInformationItem(title: steppedValueText(widget.displayState), detail: nil)]
     }
 
     /// Keeps an open detail screen in step with incoming state.
     @MainActor
     func refreshDetailTemplate() {
         switch detailTemplate {
-        case let .stepper(template, widget):
+        case let .stepper(template, widgetId):
+            guard let widget = widget(withId: widgetId) else { return }
+            template.title = stepperTitle(for: widget)
             template.items = stepperItems(for: widget)
-        case let .choice(template, widget, mappings):
+        case let .choice(template, widgetId, mappings):
+            guard let widget = widget(withId: widgetId) else { return }
             let ds = widget.displayState
             let rows = template.sections.flatMap { $0.items.compactMap { $0 as? CPListItem } }
             for (index, row) in rows.enumerated() where index < mappings.count {
@@ -638,20 +669,18 @@ extension CarPlaySceneDelegate {
         }
     }
 
-    /// A read-only value row. Disabled rather than given a no-op handler: it isn't a
-    /// control, so it should neither spin nor take a selection highlight.
+    /// A read-only value row. No handler, so a tap does nothing; leaving it enabled keeps it
+    /// legible next to the control rows.
     @MainActor
     func makeTextItem(for widget: OpenHABWidget) -> CPListItem {
         let ds = widget.displayState
-        let item = CPListItem(
+        return CPListItem(
             text: ds.labelText,
             detailText: ds.labelValue ?? ds.effectiveState,
             image: iconImage(for: widget, size: rowIconPointSize),
             accessoryImage: nil,
             accessoryType: .none
         )
-        item.isEnabled = false
-        return item
     }
 
     // MARK: - Commands

@@ -33,7 +33,10 @@ extension CarPlaySceneDelegate {
 
     static func quantisedIconState(_ widget: OpenHABWidget) -> String? {
         guard let raw = widget.iconState() else { return nil }
-        guard let value = Double(raw) else { return raw }
+        // Int(_:) traps on NaN, infinity and anything past Int's range; a Group with an
+        // AVG function over no members is enough to produce one.
+        guard let value = Double(raw), value.isFinite,
+              value >= Double(Int.min / 10), value <= Double(Int.max / 10) else { return raw }
         return String(Int((value / 10).rounded() * 10))
     }
 
@@ -67,8 +70,15 @@ extension CarPlaySceneDelegate {
     func cacheIcon(_ image: UIImage, for key: String) {
         if iconCache[key] == nil { iconCacheOrder.append(key) }
         iconCache[key] = image
-        while iconCacheOrder.count > Self.iconCacheLimit {
-            iconCache.removeValue(forKey: iconCacheOrder.removeFirst())
+
+        // Never evict artwork the current page still wants: doing so makes the next render
+        // refetch it, cache it, render again, and evict something else — indefinitely.
+        var index = 0
+        while iconCacheOrder.count > Self.iconCacheLimit, index < iconCacheOrder.count {
+            let candidate = iconCacheOrder[index]
+            if activeIconKeys.contains(candidate) { index += 1; continue }
+            iconCacheOrder.remove(at: index)
+            iconCache.removeValue(forKey: candidate)
         }
     }
 
@@ -151,22 +161,18 @@ extension CarPlaySceneDelegate {
     func fetchRemoteIcons(for widgets: [OpenHABWidget], page: OpenHABPage, service: OpenAPIService) {
         guard let connection = currentConnection else { return }
 
+        // Only what gets drawn: rows use the state-dependent URL, group buttons the
+        // state-free one, and mapping artwork is never rendered at all.
+        var wanted: Set<String> = []
         var urls: Set<URL> = []
         for widget in widgets {
-            let names = [widget.icon] + widget.displayState.mappings.compactMap(\.icon)
-            for name in names {
-                for candidate in [
-                    iconURL(name: name, widget: widget),
-                    iconURL(name: name, widget: widget, includeState: false)
-                ] {
-                    guard let candidate else { continue }
-                    let key = candidate.absoluteString
-                    if iconCache[key] == nil, !pendingIconURLs.contains(key) {
-                        urls.insert(candidate)
-                    }
-                }
-            }
+            let isGroup = widget.linkedPage != nil
+            guard let url = iconURL(name: widget.icon, widget: widget, includeState: !isGroup) else { continue }
+            let key = url.absoluteString
+            wanted.insert(key)
+            if iconCache[key] == nil, !pendingIconURLs.contains(key) { urls.insert(url) }
         }
+        activeIconKeys = wanted
         guard !urls.isEmpty else { return }
 
         let pixelSize = (rowIconPointSize * carDisplayScale).rounded()
@@ -186,7 +192,9 @@ extension CarPlaySceneDelegate {
                     return
                 }
                 cacheIcon(image, for: url.absoluteString)
-                guard currentPage?.pageId == page.pageId else { return }
+                // Identity, not id: a refresh mints a new page object with the same id, and
+                // rendering the captured one reverts every row to its pre-refresh state.
+                guard currentPage === page else { return }
                 updateTemplate(page: page, service: service)
             }
         }
