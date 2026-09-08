@@ -99,7 +99,7 @@ class OpenHABWebViewModel: ObservableObject {
     private var viewAccessOrder: [UUID] = []
     private var etagChecker: ETagChecker?
     private var etagCheckerConfigURL: String?
-    private var trackerCancellables = Set<AnyCancellable>()
+    private var networkObservationTask: Task<Void, Never>?
 
     /// JS injected after each page load to proxy the MainUI Framework7 navbar
     /// into the native bar and hide the web navbar.
@@ -557,14 +557,18 @@ class OpenHABWebViewModel: ObservableObject {
     // MARK: - Network observation
 
     private func observeNetworkChanges() {
-        MainActorNetworkTracker.shared.$activeConnection
-            .sink { [weak self] connection in
-                // Use the value the publisher delivers, not a re-read of
-                // MainActorNetworkTracker.activeConnection: @Published notifies in willSet,
-                // so the stored property still holds the previous value inside this closure.
-                self?.syncActiveConnection(with: connection)
+        networkObservationTask = Task { [weak self] in
+            var previousConnection: ConnectionInfo?
+            for await state in await NetworkTracker.shared.stateStream() {
+                guard state.activeConnection != previousConnection else { continue }
+                previousConnection = state.activeConnection
+                self?.syncActiveConnection(with: state.activeConnection)
             }
-            .store(in: &trackerCancellables)
+        }
+    }
+
+    deinit {
+        networkObservationTask?.cancel()
     }
 
     /// Reconciles the web view with the current active connection. Safe to call outside a
@@ -580,24 +584,27 @@ class OpenHABWebViewModel: ObservableObject {
     /// active (e.g. between two demo homes) loads immediately, while a switch whose
     /// connection isn't active yet blanks without ever showing the previous home.
     private func syncActiveConnection(with connection: ConnectionInfo?) {
-        let home = Preferences.shared.currentHomePreferences
-        guard let connection, home.trackedConnections.contains(connection.configuration) else {
-            clearView()
-            return
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let home = await Preferences.shared.currentHomePreferences
+            guard let connection, home.trackedConnections.contains(connection.configuration) else {
+                self.clearView()
+                return
+            }
+            // The tracker republishes on every restart, and any preferences write restarts
+            // it, so re-emitting the same connection must not disturb a page already up.
+            // Equality alone isn't enough: two demo homes both track `.demo`, so a home
+            // switch looks identical here — the web view instance tells them apart.
+            let sameConnection = self.activeConnectionInfo?.configuration == connection.configuration
+                && self.activeConnectionInfo?.proxyURL == connection.proxyURL
+            self.openHABTrackedRootUrl = connection.configuration.url
+            self.activeConnectionInfo = connection
+            if sameConnection, self.hasLoadedContent, self.isCurrentHomeWebView(home.id) {
+                Logger.viewController.info("Active connection unchanged, keeping the loaded page")
+                return
+            }
+            self.loadWebView(force: false)
         }
-        // The tracker republishes on every restart, and any preferences write restarts it,
-        // so re-emitting the same connection must not disturb a page that is already up.
-        // Equality alone isn't enough though: two demo homes both track `.demo`, so a home
-        // switch looks identical here — the web view instance is what tells them apart.
-        let sameConnection = activeConnectionInfo?.configuration == connection.configuration
-            && activeConnectionInfo?.proxyURL == connection.proxyURL
-        openHABTrackedRootUrl = connection.configuration.url
-        activeConnectionInfo = connection
-        if sameConnection, hasLoadedContent, currentHomeWebViewShown {
-            Logger.viewController.info("Active connection unchanged, keeping the loaded page")
-            return
-        }
-        loadWebView(force: false)
     }
 
     private func observeAppLifecycle() {
@@ -642,7 +649,8 @@ class OpenHABWebViewModel: ObservableObject {
         guard let activeConfig else { return }
         currentTarget = newTarget
         let url = URL(string: activeConfig.url)
-        let defaultPath = Preferences.shared.currentHomePreferences.defaultMainUIPath
+        let currentPrefs = await Preferences.shared.currentHomePreferences
+        let defaultPath = currentPrefs.defaultMainUIPath
         guard let modifiedUrl = WebViewURLHelper.resolveWebViewURL(
             baseURL: url,
             proxyURL: activeConnectionInfo?.proxyURL,
@@ -663,7 +671,7 @@ class OpenHABWebViewModel: ObservableObject {
         }
 
         let isCloudConnection = activeConfig.isCloudConnection
-        let homeId = Preferences.shared.currentHomePreferences.id
+        let homeId = currentPrefs.id
         let newWebview = getOrCreateWebView(for: homeId, isCloudConnection: isCloudConnection)
         if newWebview !== webView {
             webView.stopLoading()
@@ -686,7 +694,9 @@ class OpenHABWebViewModel: ObservableObject {
             await performLoadWebView(newTarget: newTarget, path: path, force: false)
             return
         }
-        let defaultPath = Preferences.shared.currentHomePreferences.defaultMainUIPath
+        let home = await Preferences.shared.currentHomePreferences
+        let defaultPath = home.defaultMainUIPath
+        let homeId = home.id
         guard let fullURL = WebViewURLHelper.resolveWebViewURL(
             baseURL: url,
             proxyURL: activeConnectionInfo?.proxyURL,
@@ -723,7 +733,7 @@ class OpenHABWebViewModel: ObservableObject {
 
         switch result {
         case .unchanged:
-            if canKeepLoadedPage(target: fullURL) {
+            if canKeepLoadedPage(target: fullURL, homeId: homeId) {
                 Logger.viewController.info("ETag unchanged and current home's web view already shown, skipping load")
                 currentTarget = newTarget
                 isLoading = false
@@ -739,7 +749,7 @@ class OpenHABWebViewModel: ObservableObject {
         case let .failed(error):
             // A failed check is not evidence of new content. The first request after the
             // app resumes often times out, and reloading on that throws away a good page.
-            if canKeepLoadedPage(target: fullURL) {
+            if canKeepLoadedPage(target: fullURL, homeId: homeId) {
                 Logger.viewController.info("ETag check failed: \(error.localizedDescription), keeping the loaded page")
                 currentTarget = newTarget
                 isLoading = false
@@ -751,8 +761,8 @@ class OpenHABWebViewModel: ObservableObject {
     }
 
     /// Loading again would only discard live SPA state.
-    private func canKeepLoadedPage(target: URL) -> Bool {
-        guard hasLoadedContent, currentHomeWebViewShown,
+    private func canKeepLoadedPage(target: URL, homeId: UUID) -> Bool {
+        guard hasLoadedContent, isCurrentHomeWebView(homeId),
               lastLoadedConfiguration == activeConfig else { return false }
         let normalizedTarget = WebViewURLHelper.normalizeForComparison(target.absoluteString, includeBasePath: false)
         let normalizedLoaded = WebViewURLHelper.normalizeForComparison(lastLoadedURL, includeBasePath: false)
@@ -824,8 +834,8 @@ class OpenHABWebViewModel: ObservableObject {
 
     /// True when the web view on screen is this home's own instance. Homes get one each,
     /// and two homes can share a connection, so the URL alone proves nothing.
-    private var currentHomeWebViewShown: Bool {
-        views[Preferences.shared.currentHomePreferences.id] === webView
+    private func isCurrentHomeWebView(_ homeId: UUID) -> Bool {
+        views[homeId] === webView
     }
 
     /// True once the MainUI SPA is live in the current web view and can accept
@@ -983,7 +993,9 @@ class OpenHABWebViewModel: ObservableObject {
             let url = URL(string: webviewURL.path, relativeTo: URL(string: openHABTrackedRootUrl))
             if let path = url?.path {
                 Logger.viewController.info("navigation change base: \(self.openHABTrackedRootUrl) path: \(path)")
-                Preferences.shared.currentWebViewPath = path.hasSuffix("/") ? path : path + "/"
+                Task {
+                    await Preferences.shared.setCurrentWebViewPath(path.hasSuffix("/") ? path : path + "/")
+                }
             }
         }
 
@@ -1182,9 +1194,10 @@ class OpenHABWebViewModel: ObservableObject {
     /// Loads raw HTML into a fully configured webview (scripts injected).
     /// Used by UI tests via UITestInjectHTML env var — bypasses the server URL so
     /// tests work without a live openHAB instance.
-    func loadHTMLString(_ html: String) {
+    func loadHTMLString(_ html: String) async {
         uiTestContentLocked = true
-        let wv = getOrCreateWebView(for: Preferences.shared.currentHomePreferences.id, isCloudConnection: false)
+        let homeId = (await Preferences.shared.currentHomePreferences).id
+        let wv = getOrCreateWebView(for: homeId, isCloudConnection: false)
         if wv !== webView { webView = wv }
         wv.loadHTMLString(html, baseURL: nil)
     }
@@ -1192,13 +1205,13 @@ class OpenHABWebViewModel: ObservableObject {
 
     // MARK: - Authentication
 
-    func resolvedURL() -> URL? {
+    func resolvedURL() async -> URL? {
         guard let url = URL(string: openHABTrackedRootUrl) else { return nil }
         return WebViewURLHelper.resolveWebViewURL(
             baseURL: url,
             proxyURL: activeConnectionInfo?.proxyURL,
             path: nil,
-            defaultPath: Preferences.shared.currentHomePreferences.defaultMainUIPath
+            defaultPath: (await Preferences.shared.currentHomePreferences).defaultMainUIPath
         )
     }
 }
