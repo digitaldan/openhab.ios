@@ -109,7 +109,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     var headerButtonImages: [String: String] = [:]
     var headerButtonIds: [String] = []
     /// Mutated rather than replaced; CarPlay cross-fades a replaced row.
-    var renderedItems: [String: any CPListTemplateItem] = [:]
+    var renderedItems: [String: CPListItem] = [:]
     /// Sections are only replaced when this changes.
     var renderedItemKeys: [String] = []
     /// Artwork identity per row; an image reloads only when its source changes.

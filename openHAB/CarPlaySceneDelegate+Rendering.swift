@@ -352,8 +352,8 @@ extension CarPlaySceneDelegate {
         for (index, section) in sections.enumerated() {
             guard budget > 0 else { break }
             let allowed = section.widgets.prefix(budget)
-            budget -= allowed.count
-            let rendered = allowed.flatMap { reusableRows(for: $0, service: service) }
+            let rendered = allowed.map { reusableRow(for: $0, service: service) }
+            budget -= rendered.count
             let header = section.header ?? (index == 0 ? fallbackHeader : nil)
             built.append(CPListSection(items: rendered.map(\.item), header: header, sectionIndexTitle: nil))
             signature.append("#\(header ?? "")")
@@ -406,66 +406,37 @@ extension CarPlaySceneDelegate {
     /// Reuses the on-screen row when the widget's kind is unchanged. `makeListItem` remains
     /// the only place content is decided.
     @MainActor
-    func reusableRows(for widget: OpenHABWidget, service: OpenAPIService) -> [(key: String, item: any CPListTemplateItem)] {
-        [reuse(makeListItem(for: widget, service: service), for: widget, service: service)]
-    }
-
-    @MainActor
-    func reuse(_ fresh: any CPListTemplateItem,
-               for widget: OpenHABWidget,
-               service: OpenAPIService) -> (key: String, item: any CPListTemplateItem) {
+    func reusableRow(for widget: OpenHABWidget, service: OpenAPIService) -> (key: String, item: CPListItem) {
+        let fresh = makeListItem(for: widget, service: service)
         let key = "\(widget.widgetId)|\(widget.renderingKind)"
         let imageKey = rowImageKey(for: widget)
 
-        guard let existing = renderedItems[key] else {
+        guard let live = renderedItems[key] else {
             renderedItems[key] = fresh
             renderedImageKeys[key] = imageKey
             return (key, fresh)
         }
 
-        switch (existing, fresh) {
-        case let (live as CPListItem, new as CPListItem):
-            // Each setter reloads the row. Images compare by source key, never by object:
-            // every render builds a new UIImage, so identity is always unequal.
-            if live.text != new.text {
-                live.setText(new.text ?? "")
-            }
-            if live.detailText != new.detailText {
-                live.setDetailText(new.detailText)
-            }
-            if renderedImageKeys[key] != imageKey {
-                renderedImageKeys[key] = imageKey
-                live.setImage(new.image)
-            }
-            live.handler = new.handler
-            return (key, live)
-        default:
-            break
+        // Each setter reloads the row. Images compare by source key, never by object:
+        // every render builds a new UIImage, so identity is always unequal.
+        if live.text != fresh.text {
+            live.setText(fresh.text ?? "")
         }
-
-        if #available(iOS 26.0, *),
-           let live = existing as? CPListImageRowItem,
-           let new = fresh as? CPListImageRowItem {
-            // Reassigning the array forces a re-layout, but enabled state must carry over.
-            for (liveElement, newElement) in zip(live.elements, new.elements)
-                where liveElement.isEnabled != newElement.isEnabled {
-                liveElement.isEnabled = newElement.isEnabled
-            }
-            if live.text != new.text {
-                live.text = new.text
-            }
-            live.listImageRowHandler = new.listImageRowHandler
-            return (key, live)
+        if live.detailText != fresh.detailText {
+            live.setDetailText(fresh.detailText)
         }
-
-        renderedItems[key] = fresh
-        return (key, fresh)
+        if renderedImageKeys[key] != imageKey {
+            renderedImageKeys[key] = imageKey
+            live.setImage(fresh.image)
+        }
+        live.handler = fresh.handler
+        return (key, live)
     }
 
     /// Uniform rows that always open something — no row fires a command by being pressed.
     /// Repeated adjustment pushes a screen that stays put; a one-shot choice gets a sheet.
     @MainActor
-    func makeListItem(for widget: OpenHABWidget, service: OpenAPIService) -> any CPListTemplateItem {
+    func makeListItem(for widget: OpenHABWidget, service: OpenAPIService) -> CPListItem {
         switch widget.renderingKind {
         case .text:
             return makeTextItem(for: widget)
@@ -568,20 +539,26 @@ extension CarPlaySceneDelegate {
     /// Unlike `CPListTemplate`, this template's items are settable, so the value updates in
     /// place while the screen stays open. Three actions is the cap.
     @MainActor
-    func pushStepperDetail(for widget: OpenHABWidget, service: OpenAPIService) {
-        let ds = widget.displayState
+    func pushStepperDetail(for initialWidget: OpenHABWidget, service: OpenAPIService) {
+        let ds = initialWidget.displayState
         let step = ds.step.valueText(step: ds.step)
 
+        // Resolve by id on every press: a page refresh replaces every OpenHABWidget, and
+        // these closures outlive it, so a captured one would step from the value the screen
+        // opened with no matter what the row now reads.
+        let widgetId = initialWidget.widgetId
         let template = CPInformationTemplate(
-            title: stepperTitle(for: widget),
+            title: stepperTitle(for: initialWidget),
             layout: .leading,
-            items: stepperItems(for: widget),
+            items: stepperItems(for: initialWidget),
             actions: [
                 CPTextButton(title: "−  \(step)", textStyle: .normal) { [weak self] _ in
-                    self?.sendStep(for: widget, decreasing: true, service: service)
+                    guard let self, let live = widget(withId: widgetId) else { return }
+                    sendStep(for: live, decreasing: true, service: service)
                 },
                 CPTextButton(title: "+  \(step)", textStyle: .normal) { [weak self] _ in
-                    self?.sendStep(for: widget, decreasing: false, service: service)
+                    guard let self, let live = widget(withId: widgetId) else { return }
+                    sendStep(for: live, decreasing: false, service: service)
                 }
             ]
         )
@@ -589,13 +566,14 @@ extension CarPlaySceneDelegate {
         if ds.switchSupport {
             template.trailingNavigationBarButtons = Self.onOffMappings.map { mapping in
                 let button = CPBarButton(title: mapping.label) { [weak self] _ in
-                    self?.send(mapping: mapping, for: widget, service: service)
+                    guard let self, let live = widget(withId: widgetId) else { return }
+                    send(mapping: mapping, for: live, service: service)
                 }
                 button.buttonStyle = .rounded
                 return button
             }
         }
-        detailTemplate = .stepper(template, widget.widgetId)
+        detailTemplate = .stepper(template, widgetId)
         interfaceController?.pushTemplate(template, animated: true, completion: nil)
     }
 
@@ -690,11 +668,14 @@ extension CarPlaySceneDelegate {
     func send(mapping: OpenHABWidgetMapping, for widget: OpenHABWidget, service: OpenAPIService) {
         guard let name = widget.item?.name else { return }
         Task {
-            if !mapping.command.isEmpty {
+            let pressed = !mapping.command.isEmpty
+            if pressed {
                 try? await service.sendItemCommand(itemname: name, command: mapping.command)
             }
             if let release = mapping.releaseCommand, !release.isEmpty {
-                try? await Task.sleep(for: .milliseconds(500))
+                // Only to separate the pair. A release-only widget has nothing to separate
+                // from, and the delay would just be dead time before its one command.
+                if pressed { try? await Task.sleep(for: .milliseconds(500)) }
                 try? await service.sendItemCommand(itemname: name, command: release)
             }
         }

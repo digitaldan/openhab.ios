@@ -55,10 +55,8 @@ extension CarPlaySceneDelegate {
     /// Server icons preferred, so custom and state-dependent artwork renders as authored.
     /// The SF Symbol is the synchronous placeholder, and the fallback when there is none.
     @MainActor
-    func iconImage(for widget: OpenHABWidget,
-                   mapping: OpenHABWidgetMapping? = nil,
-                   size pointSize: CGFloat) -> UIImage {
-        let name = mapping?.icon ?? widget.icon
+    func iconImage(for widget: OpenHABWidget, size pointSize: CGFloat) -> UIImage {
+        let name = widget.icon
         if let url = iconURL(name: name, widget: widget),
            let cached = iconCache[url.absoluteString] {
             return squared(cached, to: pointSize)

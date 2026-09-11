@@ -42,6 +42,30 @@ struct CarPlaySitemapStructureTests {
         widget(id: id, label: label, type: .switchWidget, item: item())
     }
 
+    func numberItem(state: String) -> OpenHABItem {
+        OpenHABItem(
+            name: "N", type: "Number", state: state, link: "", label: "N",
+            groupType: nil, stateDescription: nil, commandDescription: nil,
+            members: [], category: nil, options: nil
+        )
+    }
+
+    /// A Number item takes `iconState()`'s numeric branch; a Switch would short-circuit to ON/OFF.
+    func numberWidget(id: String, state: String) -> OpenHABWidget {
+        widget(id: id, label: "Dimmer", type: .slider, item: numberItem(state: state))
+    }
+
+    /// A String item falls through to `iconState()`'s `return itemState`, the one path that
+    /// hands back the raw state — a Number item is sanitised by parseAsNumber first.
+    func rawStateWidget(id: String, state: String) -> OpenHABWidget {
+        let item = OpenHABItem(
+            name: "S", type: "String", state: state, link: "", label: "S",
+            groupType: nil, stateDescription: nil, commandDescription: nil,
+            members: [], category: nil, options: nil
+        )
+        return widget(id: id, label: "Group", type: .text, item: item)
+    }
+
     func widget(id: String,
                 label: String,
                 type: OpenHABWidget.WidgetType,
@@ -156,5 +180,61 @@ struct CarPlaySitemapStructureTests {
     @Test
     func rollershutterFallbackCarriesTheThreeStandardCommands() {
         #expect(CarPlaySceneDelegate.rollershutterMappings.map(\.command) == ["UP", "STOP", "DOWN"])
+    }
+
+    // MARK: - Widget-level press/release
+
+    /// A sitemap can declare command/releaseCommand on the widget instead of in a mapping.
+    /// Deleting the old sendDefaultAction dropped these, so they are covered explicitly.
+    @Test
+    func widgetLevelMappingCarriesPressAndRelease() {
+        let w = switchWidget(id: "1_0", label: "Gate")
+        w.command = "ON"
+        w.releaseCommand = "OFF"
+
+        let mapping = CarPlaySceneDelegate.widgetLevelMapping(for: w)
+
+        #expect(mapping?.command == "ON")
+        #expect(mapping?.releaseCommand == "OFF")
+    }
+
+    @Test
+    func releaseOnlyWidgetSuppressesThePressCommand() {
+        let w = switchWidget(id: "1_0", label: "Gate")
+        w.command = "ON"
+        w.releaseCommand = "OFF"
+        w.releaseOnly = true
+
+        let mapping = CarPlaySceneDelegate.widgetLevelMapping(for: w)
+
+        #expect(mapping?.command.isEmpty == true)
+        #expect(mapping?.releaseCommand == "OFF")
+    }
+
+    @Test
+    func widgetWithNeitherCommandYieldsNoMapping() {
+        #expect(CarPlaySceneDelegate.widgetLevelMapping(for: switchWidget(id: "1_0", label: "Lamp")) == nil)
+    }
+
+    // MARK: - Icon state quantisation
+
+    /// `Int(_:)` traps on NaN, infinity and anything past Int's range. A Group with an AVG
+    /// function over no members reaches this with a non-finite state.
+    @Test
+    func degenerateIconStateFallsBackToTheRawStringInsteadOfTrapping() {
+        for raw in ["NaN", "inf", "-inf", "1e300", "-1e300"] {
+            let quantised = CarPlaySceneDelegate.quantisedIconState(rawStateWidget(id: "1_0", state: raw))
+            #expect(quantised == raw, "\(raw) should pass through, got \(quantised ?? "nil")")
+        }
+    }
+
+    @Test
+    func iconStateRoundsToNearestTen() {
+        // rounded() is half-away-from-zero, so 5 goes up rather than to even.
+        let cases: [(String, String)] = [("0", "0"), ("4", "0"), ("5", "10"), ("6", "10"), ("54", "50"), ("100", "100")]
+        for (state, expected) in cases {
+            let quantised = CarPlaySceneDelegate.quantisedIconState(numberWidget(id: "1_0", state: state))
+            #expect(quantised == expected, "\(state) should quantise to \(expected), got \(quantised ?? "nil")")
+        }
     }
 }
