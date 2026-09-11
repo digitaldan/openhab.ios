@@ -10,7 +10,6 @@
 // SPDX-License-Identifier: EPL-2.0
 
 import CarPlay
-import Combine
 import CommonUI
 import Kingfisher
 import OpenHABCore
@@ -93,7 +92,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     var interfaceController: CPInterfaceController?
     var streamTask: Task<Void, Never>?
     var refreshTask: Task<Void, Never>?
-    var preferencesCancellable: AnyCancellable?
+    var preferencesTask: Task<Void, Never>?
     let sitemapEventStream = SitemapEventStream()
     /// openHAB scopes a subscription per page and the main stream follows the selected
     /// group, so a group's own `Text` widget needs its own.
@@ -130,6 +129,8 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     var currentPage: OpenHABPage?
     var currentService: OpenAPIService?
     var currentConnection: ConnectionInfo?
+    /// Cached from runStream: Preferences is actor-isolated, and syncRootStream is not async.
+    var currentSitemapName = ""
     /// In flight, so repeated renders don't queue duplicates.
     var pendingIconURLs: Set<String> = []
     /// Keyed by icon URL so re-renders resolve synchronously.
@@ -173,8 +174,8 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         streamTask = nil
         refreshTask?.cancel()
         refreshTask = nil
-        preferencesCancellable?.cancel()
-        preferencesCancellable = nil
+        preferencesTask?.cancel()
+        preferencesTask = nil
         pendingIconURLs.removeAll()
         rootStreamTask?.cancel()
         rootStreamTask = nil
@@ -200,6 +201,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         currentPage = nil
         currentService = nil
         currentConnection = nil
+        currentSitemapName = ""
         iconCache.removeAll()
         iconCacheOrder.removeAll()
         activeIconKeys.removeAll()
@@ -233,30 +235,26 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     }
 
     func startObservingPreferences() {
-        var lastSitemap = Preferences.shared.currentHomePreferences.sitemapForCarPlay
-        // currentHomePreferencesPublisher is driven by the in-memory @Published preferences
-        // that modifyActiveHome(...) updates synchronously. UserDefaults.didChangeNotification,
-        // used here before, isn't reliably posted for the App Group suite, so CarPlay could
-        // keep streaming a stale sitemap.
-        //
-        // sink rather than .values/for-await: Combine's AsyncPublisher bridge asserts delivery
-        // on the executor captured at subscription and crashes (dispatch_assert_queue) when
-        // delivery lands on the cooperative pool instead.
-        preferencesCancellable = Preferences.shared.currentHomePreferencesPublisher
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] prefs in
-                guard let self else { return }
+        preferencesTask?.cancel()
+        preferencesTask = Task { [weak self] in
+            // currentHomePreferencesStream is backed by currentHomePreferencesPublisher but
+            // delivered via AsyncStream continuation — avoids the dispatch_assert_queue crash
+            // that the Combine AsyncPublisher bridge (.values) caused here previously.
+            var lastSitemap = await Preferences.shared.currentHomePreferences.sitemapForCarPlay
+            for await prefs in await Preferences.shared.currentHomePreferencesStream {
+                guard !Task.isCancelled else { break }
                 let newSitemap = prefs.sitemapForCarPlay
-                guard newSitemap != lastSitemap else { return }
+                guard newSitemap != lastSitemap else { continue }
                 lastSitemap = newSitemap
                 // Sitemap selection changed — full restart needed (different page/subscription).
-                startStreaming()
+                await MainActor.run { self?.startStreaming() }
             }
+        }
     }
 
     @MainActor
     func runStream() async -> StreamOutcome {
-        let prefs = Preferences.shared.currentHomePreferences
+        let prefs = await Preferences.shared.currentHomePreferences
         await NetworkTracker.shared.startTracking(connectionConfigurations: [
             prefs.localConnectionConfig,
             prefs.remoteConnectionConfig
@@ -266,7 +264,8 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
             showUnreachableIfEmpty()
             return .failed
         }
-        let sitemapName = Preferences.shared.currentHomePreferences.sitemapForCarPlay
+        let sitemapName = await Preferences.shared.currentHomePreferences.sitemapForCarPlay
+        currentSitemapName = sitemapName
         guard !sitemapName.isEmpty else {
             Logger.carPlay.info("CarPlay: no sitemap configured")
             interfaceController?.setRootTemplate(
@@ -408,7 +407,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     /// Only when a group carries an item, so the common case costs one connection.
     @MainActor
     func syncRootStream(groups: [SitemapGroup]) {
-        let sitemapName = Preferences.shared.currentHomePreferences.sitemapForCarPlay
+        let sitemapName = currentSitemapName
         let needed = subscribedPageId != nil
             && !sitemapName.isEmpty
             && groups.contains { $0.source?.item != nil }

@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [Version 3.4.26, Build 322] - 2026-09-05Z
+
+- Stabilize NetworkTracker client-error retry test in CI (#1323)
+- fix(widget): use server transformedState in Sensor Home Screen widget (#1322)
+- chore(deps): update Firebase SDK 12.10.0 -> 12.18.0, refresh upload-symbols (#1320)
+- Slightly widening the new menu (#1319)
+
+## [Version 3.4.25, Build 321] - 2026-08-25Z
+
+- fix(watch): restore OpenHABWatchComplicationsExtension Xcode target (#1318)
+
+## [Version 3.4.24, Build 320] - 2026-08-24Z
+
+- fix(lifecycle): prevent black screen on upgrade from storyboard-based build
+
+## [Version 3.4.23, Build 319] - 2026-08-22Z
+
+- fix(homes): localize "Local"/"Remote" labels in home summary
+- i18n: remove 37 stale string catalog entries
+- fix(settings): defer save until Local Network alert is acknowledged
+- fix(settings): CarPlay sitemap picker respects Show/Sort sitemaps by
+
 ## [Version 3.4.22, Build 318] - 2026-08-22Z
 
 - feat(carplay): update grid buttons in place on iOS 26 to preserve focus
