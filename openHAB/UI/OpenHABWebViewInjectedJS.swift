@@ -397,6 +397,27 @@ let webViewNavbarProxyJS = """
     })();
 """
 
+/// Catches taps on links that open other apps.
+/// `e.isTrusted` skips clicks made by scripts, so only real taps get through.
+let webViewExternalURLInterceptorJS = """
+    (function() {
+        const nativeSchemes = ['http', 'https', 'about', 'blob', 'data', 'javascript', ''];
+        function isCustomScheme(url) {
+            const m = /^([a-z][a-z0-9+\\-.]*):/.exec((url || '').toLowerCase());
+            return m != null && !nativeSchemes.includes(m[1]);
+        }
+        document.addEventListener('click', function(e) {
+            if (!e.isTrusted) return;
+            let el = e.target;
+            while (el && el.tagName !== 'A') el = el.parentElement;
+            if (el && el.href && isCustomScheme(el.href)) {
+                e.preventDefault();
+                window.webkit.messageHandlers.externalURL.postMessage(el.href);
+            }
+        }, true);
+    })();
+"""
+
 let webViewMainUIBridgeJS = """
     (function() {
         // App-menu button probe.
