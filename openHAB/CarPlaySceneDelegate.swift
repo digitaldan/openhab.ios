@@ -11,34 +11,142 @@
 
 import CarPlay
 import CommonUI
+import Kingfisher
 import OpenHABCore
 import os.log
 import SFSafeSymbols
 
-private var carPlayMaxItems: Int {
-    Int(CPGridTemplateMaximumItems)
+enum StreamOutcome {
+    /// Reconnect now.
+    case ended
+    /// Back off.
+    case failed
+    /// Wait for a preferences change.
+    case idle
+}
+
+struct BuiltSections {
+    let sections: [CPListSection]
+    /// Includes headers, so a renamed frame counts as a change.
+    let signature: [String]
+    let keys: [String]
+}
+
+/// Holds a widget id, not a widget, which would go stale after a page refresh.
+enum CarPlayDetail {
+    case stepper(CPInformationTemplate, String)
+    case choice(CPListTemplate, String, [OpenHABWidgetMapping])
+
+    var template: CPTemplate {
+        switch self {
+        case let .stepper(template, _): template
+        case let .choice(template, _, _): template
+        }
+    }
+}
+
+struct WidgetSection {
+    let header: String?
+    let widgets: [OpenHABWidget]
+}
+
+/// A `Text` widget and its linked page.
+struct SitemapGroup {
+    let id: String
+    /// Label and value.
+    let title: String
+    /// Label only.
+    let name: String
+    /// nil for the Default group.
+    let source: OpenHABWidget?
+    let sections: [WidgetSection]
+
+    var widgets: [OpenHABWidget] {
+        sections.flatMap(\.widgets)
+    }
 }
 
 final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
-    private var interfaceController: CPInterfaceController?
-    private var streamTask: Task<Void, Never>?
-    private var refreshTask: Task<Void, Never>?
-    private var preferencesTask: Task<Void, Never>?
-    private let sitemapEventStream = SitemapEventStream()
-    private var currentGridTemplate: CPGridTemplate?
+    static let defaultGroupId = "__default__"
+
+    /// openHAB's names for "no icon".
+    static let placeholderIconNames: Set<String> = ["", "none", "text", "frame"]
+
+    static let iconCacheLimit = 120
+
+    static let onOffMappings = [
+        OpenHABWidgetMapping(command: "ON", label: String(localized: "carplay_on")),
+        OpenHABWidgetMapping(command: "OFF", label: String(localized: "carplay_off"))
+    ]
+
+    static let rollershutterMappings = [
+        OpenHABWidgetMapping(command: "UP", label: String(localized: "carplay_open")),
+        OpenHABWidgetMapping(command: "STOP", label: String(localized: "carplay_stop")),
+        OpenHABWidgetMapping(command: "DOWN", label: String(localized: "carplay_close"))
+    ]
+
+    var interfaceController: CPInterfaceController?
+    var streamTask: Task<Void, Never>?
+    var refreshTask: Task<Void, Never>?
+    var preferencesTask: Task<Void, Never>?
+    let sitemapEventStream = SitemapEventStream()
+    /// Keeps the group widgets live; the main stream follows the selected group's page.
+    let rootEventStream = SitemapEventStream()
+    var rootStreamTask: Task<Void, Never>?
+    var sessionConfiguration: CPSessionConfiguration?
+    var currentListTemplate: CPListTemplate?
+    var activeGroupId: String?
+    /// Updated in place; reassigning redraws the list.
+    var headerButtons: [String: CPGridButton] = [:]
+    var headerButtonTitles: [String: String] = [:]
+    var headerButtonImages: [String: String] = [:]
+    var headerButtonIds: [String] = []
+    /// Updated in place; CarPlay cross-fades a replaced row.
+    var renderedItems: [String: CPListItem] = [:]
+    var renderedItemKeys: [String] = []
+    var renderedImageKeys: [String: String] = [:]
+    var lastRenderFingerprint: String?
+    var detailTemplate: CarPlayDetail?
+    var currentTabBarTemplate: CPTabBarTemplate?
+    var groupTemplates: [String: CPListTemplate] = [:]
+    var currentGroupIds: [String] = []
+    var renderedKeysByGroup: [String: [String]] = [:]
+    /// nil is the home page.
+    var subscribedPageId: String?
+    let setpointService = SetPointService()
     // Retained across SSE restarts so page refreshes don't need a full stream teardown.
-    private var currentPage: OpenHABPage?
-    private var currentService: OpenAPIService?
-    // Tracks the buttons currently on screen, keyed by widgetId, so updateTemplate can mutate
-    // existing CPGridButton instances in place (iOS 26+) instead of replacing the whole array —
-    // CPGridTemplate.updateGridButtons(_:) resets CarPlay's focused button, so avoiding it when
-    // only a button's state (not the widget set/order) changed keeps focus on the pressed button.
-    private var gridButtonsByWidgetId: [String: CPGridButton] = [:]
-    private var gridButtonOrder: [String] = []
+    var currentPage: OpenHABPage?
+    var currentService: OpenAPIService?
+    var currentConnection: ConnectionInfo?
+    /// Cached because Preferences is actor-isolated.
+    var currentSitemapName = ""
+    var pendingIconURLs: Set<String> = []
+    var iconCache: [String: UIImage] = [:]
+    /// Never evicted.
+    var activeIconKeys: Set<String> = []
+    var iconCacheOrder: [String] = []
+
+    static func widgetLevelMapping(for widget: OpenHABWidget) -> OpenHABWidgetMapping? {
+        let press = widget.releaseOnly == true ? nil : widget.command
+        let release = widget.releaseCommand
+        guard press?.isEmpty == false || release?.isEmpty == false else { return nil }
+        return OpenHABWidgetMapping(
+            command: press,
+            label: widget.displayState.labelText,
+            releaseCommand: release
+        )
+    }
+
+    static func retryDelay(failures: Int) -> Int {
+        guard failures > 0 else { return 2 }
+        return min(30, 1 << min(failures, 5))
+    }
 
     func templateApplicationScene(_ templateApplicationScene: CPTemplateApplicationScene,
                                   didConnect interfaceController: CPInterfaceController) {
         self.interfaceController = interfaceController
+        interfaceController.delegate = self
+        sessionConfiguration = CPSessionConfiguration(delegate: self)
         interfaceController.setRootTemplate(placeholderTemplate(), animated: false, completion: nil)
         startStreaming()
         startObservingPreferences()
@@ -53,22 +161,65 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         refreshTask = nil
         preferencesTask?.cancel()
         preferencesTask = nil
+        pendingIconURLs.removeAll()
+        rootStreamTask?.cancel()
+        rootStreamTask = nil
         Task { await sitemapEventStream.stop() }
+        Task { [rootEventStream] in await rootEventStream.stop() }
         self.interfaceController = nil
-        currentGridTemplate = nil
+        currentListTemplate = nil
+        currentTabBarTemplate = nil
+        groupTemplates.removeAll()
+        currentGroupIds.removeAll()
+        renderedKeysByGroup.removeAll()
+        activeGroupId = nil
+        headerButtons.removeAll()
+        headerButtonTitles.removeAll()
+        headerButtonImages.removeAll()
+        headerButtonIds.removeAll()
+        subscribedPageId = nil
+        renderedItems.removeAll()
+        renderedItemKeys.removeAll()
+        renderedImageKeys.removeAll()
+        lastRenderFingerprint = nil
+        detailTemplate = nil
         currentPage = nil
         currentService = nil
+        currentConnection = nil
+        currentSitemapName = ""
+        iconCache.removeAll()
+        iconCacheOrder.removeAll()
+        activeIconKeys.removeAll()
+        sessionConfiguration = nil
         Logger.carPlay.info("CarPlay scene disconnected")
     }
 
     // MARK: - Streaming
 
-    private func startStreaming() {
+    func startStreaming() {
         streamTask?.cancel()
-        streamTask = Task { [weak self] in await self?.runStream() }
+        streamTask = Task { [weak self] in
+            var failures = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                let outcome = await runStream()
+                guard !Task.isCancelled else { return }
+                switch outcome {
+                case .idle:
+                    return
+                case .ended:
+                    failures = 0
+                case .failed:
+                    failures += 1
+                }
+                let delay = Self.retryDelay(failures: failures)
+                Logger.carPlay.info("CarPlay stream ended (\(String(describing: outcome))), retrying in \(delay)s")
+                try? await Task.sleep(for: .seconds(delay))
+            }
+        }
     }
 
-    private func startObservingPreferences() {
+    func startObservingPreferences() {
         preferencesTask?.cancel()
         preferencesTask = Task { [weak self] in
             // currentHomePreferencesStream is backed by currentHomePreferencesPublisher but
@@ -87,7 +238,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     }
 
     @MainActor
-    private func runStream() async {
+    func runStream() async -> StreamOutcome {
         let prefs = await Preferences.shared.currentHomePreferences
         await NetworkTracker.shared.startTracking(connectionConfigurations: [
             prefs.localConnectionConfig,
@@ -95,42 +246,82 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         ])
         guard let connection = await NetworkTracker.shared.waitForActiveConnection() else {
             Logger.carPlay.warning("CarPlay: no active connection")
-            return
+            showUnreachableIfEmpty()
+            return .failed
         }
-        let sitemapName = await (Preferences.shared.currentHomePreferences).sitemapForCarPlay
+        let sitemapName = await Preferences.shared.currentHomePreferences.sitemapForCarPlay
+        currentSitemapName = sitemapName
         guard !sitemapName.isEmpty else {
             Logger.carPlay.info("CarPlay: no sitemap configured")
             interfaceController?.setRootTemplate(
                 placeholderTemplate(message: String(localized: "carplay_not_configured_detail")),
                 animated: false, completion: nil
             )
-            return
+            return .idle
         }
         do {
             let service = try OpenAPIService(connectionConfiguration: connection.configuration)
             currentService = service
+            currentConnection = connection
 
-            guard let page = try await service.pollDataForPage(
-                sitemapname: sitemapName, pageId: "", longPolling: false
-            ) else { return }
+            guard let page = try await fetchPage(sitemapName: sitemapName, service: service) else {
+                showUnreachableIfEmpty()
+                return .failed
+            }
             currentPage = page
             updateTemplate(page: page, service: service)
 
-            let serverProps = try? await service.getRoot()
-            if serverProps?.hasSseSupport() == true {
+            // A failed probe means retry, not fall back to long-polling for good.
+            let serverProps: OpenHABServerProperties
+            do {
+                serverProps = try await service.getRoot()
+            } catch {
+                Logger.carPlay.warning("CarPlay server probe failed, will retry: \(error)")
+                return .failed
+            }
+
+            if serverProps.hasSseSupport() {
                 await runSSE(sitemapName: sitemapName, connection: connection)
             } else {
                 await runLongPoll(sitemapName: sitemapName, pageId: page.pageId, service: service)
             }
+            return .ended
         } catch {
             Logger.carPlay.error("CarPlay stream error: \(error)")
+            showUnreachableIfEmpty()
+            return .failed
         }
     }
 
     @MainActor
-    private func runSSE(sitemapName: String, connection: ConnectionInfo) async {
+    func widget(withId id: String) -> OpenHABWidget? {
+        guard let page = currentPage else { return nil }
+        if let match = page.widgets.first(where: { $0.widgetId == id }) {
+            return match
+        }
+        for widget in page.widgets {
+            if let match = widget.linkedPage?.widgets.first(where: { $0.widgetId == id }) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    /// Keeps the last known state if the connection drops.
+    @MainActor
+    func showUnreachableIfEmpty() {
+        guard currentListTemplate == nil, currentTabBarTemplate == nil else { return }
+        interfaceController?.setRootTemplate(
+            placeholderTemplate(message: String(localized: "carplay_unreachable")),
+            animated: false, completion: nil
+        )
+    }
+
+    @MainActor
+    func runSSE(sitemapName: String, connection: ConnectionInfo) async {
         await sitemapEventStream.startMonitoringNetworkIfNeeded(initialConnection: connection)
-        let pageId = currentPage.map { $0.pageId.isEmpty ? sitemapName : $0.pageId } ?? sitemapName
+        let homePageId = currentPage.map { $0.pageId.isEmpty ? sitemapName : $0.pageId } ?? sitemapName
+        let pageId = subscribedPageId ?? homePageId
         let stream = await sitemapEventStream.stream(sitemap: sitemapName, pageId: pageId)
         Logger.carPlay.info("CarPlay SSE starting for \(sitemapName)/\(pageId)")
 
@@ -158,7 +349,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     }
 
     @MainActor
-    private func handleSseMessage(_ message: SitemapEventMessage, sitemapName: String) {
+    func handleSseMessage(_ message: SitemapEventMessage, sitemapName: String) {
         switch message {
         case .alive:
             break
@@ -168,7 +359,12 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
             schedulePageRefresh(sitemapName: sitemapName)
         case let .widget(event):
             guard let page = currentPage, let service = currentService else { return }
-            switch page.apply(event: event) {
+            var result = page.apply(event: event)
+            // apply(event:) skips linked pages.
+            if result == .notFound {
+                result = applyToLinkedPages(event: event, in: page)
+            }
+            switch result {
             case .applied:
                 updateTemplate(page: page, service: service)
             case .requiresPageReload, .notFound:
@@ -177,28 +373,132 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
             case .unchanged:
                 break
             }
-        case let .unknown(raw):
-            Logger.carPlay.debug("CarPlay SSE unknown: \(raw)")
+        case .unknown:
+            break
         }
     }
 
-    /// Refreshes `currentPage` from the server and updates the template without restarting the SSE stream.
-    /// Cancels any in-flight refresh so rapid events coalesce into a single fetch.
-    private func schedulePageRefresh(sitemapName: String) {
+    /// Only the selected tab is subscribed, so switching refreshes first.
+    @MainActor
+    func repointSubscription(to groupId: String) {
+        let pageId: String? = groupId == Self.defaultGroupId ? nil : groupId
+        guard pageId != subscribedPageId else { return }
+        subscribedPageId = pageId
+
+        startStreaming()
+    }
+
+    /// Whole sitemap, since `pollDataForPage` returns linked pages without widgets.
+    func fetchPage(sitemapName: String, service: OpenAPIService) async throws -> OpenHABPage? {
+        try await service.pollDataForSitemap(sitemapname: sitemapName)?.page
+    }
+
+    /// Only runs when a group has an item.
+    @MainActor
+    func syncRootStream(groups: [SitemapGroup]) {
+        let sitemapName = currentSitemapName
+        let needed = subscribedPageId != nil
+            && !sitemapName.isEmpty
+            && groups.contains { $0.source?.item != nil }
+
+        guard needed else {
+            guard rootStreamTask != nil else { return }
+            Logger.carPlay.info("CarPlay root SSE no longer needed, closing")
+            rootStreamTask?.cancel()
+            rootStreamTask = nil
+            Task { [rootEventStream] in await rootEventStream.stop() }
+            return
+        }
+
+        guard rootStreamTask == nil, let connection = currentConnection else { return }
+        let pageId = currentPage.map { $0.pageId.isEmpty ? sitemapName : $0.pageId } ?? sitemapName
+        rootStreamTask = Task { @MainActor [weak self] in
+            await self?.runRootSSE(sitemapName: sitemapName, pageId: pageId, connection: connection)
+        }
+    }
+
+    @MainActor
+    func runRootSSE(sitemapName: String, pageId: String, connection: ConnectionInfo) async {
+        await rootEventStream.startMonitoringNetworkIfNeeded(initialConnection: connection)
+        var failures = 0
+
+        while !Task.isCancelled {
+            let stream = await rootEventStream.stream(sitemap: sitemapName, pageId: pageId)
+            Logger.carPlay.info("CarPlay root SSE starting for \(sitemapName)/\(pageId)")
+
+            for await msg in stream {
+                guard !Task.isCancelled else { return }
+                switch msg {
+                case .connected:
+                    failures = 0
+                    Logger.carPlay.info("CarPlay root SSE connected")
+                case let .disconnected(error):
+                    if let error {
+                        Logger.carPlay.warning("CarPlay root SSE disconnected: \(error)")
+                    }
+                case let .event(message):
+                    handleRootSseMessage(message, sitemapName: sitemapName)
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            failures += 1
+            let delay = Self.retryDelay(failures: failures)
+            Logger.carPlay.info("CarPlay root SSE ended, retrying in \(delay)s")
+            try? await Task.sleep(for: .seconds(delay))
+        }
+    }
+
+    @MainActor
+    func handleRootSseMessage(_ message: SitemapEventMessage, sitemapName: String) {
+        switch message {
+        case .alive:
+            break
+        case .sitemapChanged:
+            schedulePageRefresh(sitemapName: sitemapName)
+        case let .widget(event):
+            guard let page = currentPage, let service = currentService else { return }
+            switch page.apply(event: event) {
+            case .applied:
+                updateTemplate(page: page, service: service)
+            case .requiresPageReload:
+                schedulePageRefresh(sitemapName: sitemapName)
+            case .notFound, .unchanged:
+                break
+            }
+        case .unknown:
+            break
+        }
+    }
+
+    @MainActor
+    func applyToLinkedPages(event: OpenHABSitemapWidgetEvent,
+                            in page: OpenHABPage) -> SitemapWidgetEventApplicationResult {
+        for widget in page.widgets {
+            guard let linked = widget.linkedPage else { continue }
+            let result = linked.apply(event: event)
+            if result != .notFound {
+                return result
+            }
+        }
+        return .notFound
+    }
+
+    /// The delay coalesces events; cancelling alone would abort every fetch under steady load.
+    func schedulePageRefresh(sitemapName: String) {
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
             guard let self, !Task.isCancelled else { return }
             await refreshPage(sitemapName: sitemapName)
         }
     }
 
     @MainActor
-    private func refreshPage(sitemapName: String) async {
+    func refreshPage(sitemapName: String) async {
         guard let service = currentService else { return }
         do {
-            guard let page = try await service.pollDataForPage(
-                sitemapname: sitemapName, pageId: "", longPolling: false
-            ) else { return }
+            guard let page = try await fetchPage(sitemapName: sitemapName, service: service) else { return }
             currentPage = page
             updateTemplate(page: page, service: service)
         } catch {
@@ -207,191 +507,48 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     }
 
     @MainActor
-    private func runLongPoll(sitemapName: String, pageId: String, service: OpenAPIService) async {
+    func runLongPoll(sitemapName: String, pageId: String, service: OpenAPIService) async {
         Logger.carPlay.info("CarPlay using long-poll for \(sitemapName)")
         do {
             for try await event in SitemapPageLoader.stream(sitemapName: sitemapName, pageId: pageId, service: service) {
                 guard !Task.isCancelled else { break }
-                if case let .longPoll(page, _) = event {
-                    currentPage = page
-                    updateTemplate(page: page, service: service)
+                // The polled page lacks linked-page widgets, so refetch the whole tree.
+                if case .longPoll = event {
+                    schedulePageRefresh(sitemapName: sitemapName)
                 }
             }
         } catch {
             Logger.carPlay.error("CarPlay long-poll error: \(error)")
         }
     }
+}
 
-    // MARK: - Template building
+// MARK: - CPTabBarTemplateDelegate
 
-    @MainActor
-    private func updateTemplate(page: OpenHABPage, service: OpenAPIService) {
-        let widgets = Array(
-            page.widgets
-                .filter { $0.visibility && isCarPlayCompatible($0) }
-                .prefix(carPlayMaxItems)
-        )
-
-        guard !widgets.isEmpty else {
-            currentGridTemplate = nil
-            gridButtonsByWidgetId.removeAll()
-            gridButtonOrder = []
-            interfaceController?.setRootTemplate(placeholderTemplate(), animated: false, completion: nil)
-            return
-        }
-
-        let title = page.title.isEmpty ? "openHAB" : "openHAB – \(page.title)"
-        let newOrder = widgets.map(\.widgetId)
-
-        if #available(iOS 26.0, *),
-           let existing = currentGridTemplate,
-           newOrder == gridButtonOrder {
-            // Same buttons, same order — update each in place so CarPlay doesn't reset focus.
-            existing.updateTitle(title)
-            for widget in widgets {
-                guard let button = gridButtonsByWidgetId[widget.widgetId] else { continue }
-                button.updateTitleVariants([widget.displayState.labelText])
-                button.updateImage(sfSymbol(for: widget))
-            }
-            return
-        }
-
-        // Button set/order changed, or pre-iOS 26 — full rebuild (resets CarPlay's focus).
-        let buttons = widgets.map { makeGridButton(for: $0, service: service) }
-        gridButtonOrder = newOrder
-        gridButtonsByWidgetId = Dictionary(zip(newOrder, buttons)) { first, _ in
-            first
-        }
-
-        if let existing = currentGridTemplate {
-            existing.updateTitle(title)
-            existing.updateGridButtons(buttons)
-        } else {
-            let template = CPGridTemplate(title: title, gridButtons: buttons)
-            currentGridTemplate = template
-            interfaceController?.setRootTemplate(template, animated: false, completion: nil)
-        }
+extension CarPlaySceneDelegate: CPTabBarTemplateDelegate {
+    func tabBarTemplate(_ tabBarTemplate: CPTabBarTemplate, didSelect selectedTemplate: CPTemplate) {
+        guard let id = groupTemplates.first(where: { $0.value === selectedTemplate })?.key else { return }
+        Logger.carPlay.info("CarPlay tab selected: \(id)")
+        repointSubscription(to: id)
     }
+}
 
-    private func sfSymbol(for widget: OpenHABWidget) -> UIImage {
-        // Determine the CarPlay grid button box and choose a comfortable symbol point size
-        let box = carPlayGridButtonImageSize()
-        let pointSize = min(box.width, box.height) * 0.8
+// MARK: - CPSessionConfigurationDelegate
 
-        // Build the configured SF Symbol image (vector-backed), template rendering
-        let symbol = openHABSFSymbol(for: widget.icon, isOn: widget.displayState.isOn)
-        let config = UIImage.SymbolConfiguration(pointSize: pointSize, weight: .regular, scale: .medium)
-        let baseImage = UIImage(systemSymbol: symbol)
-            .applyingSymbolConfiguration(config)?
-            .withRenderingMode(.alwaysTemplate)
-            ?? UIImage(systemSymbol: symbol).withRenderingMode(.alwaysTemplate)
-
-        // Render into a square canvas using aspect-fit to avoid any stretching
-        return renderSymbolImage(baseImage, pointSize: pointSize, boxSize: box)
+extension CarPlaySceneDelegate: CPSessionConfigurationDelegate {
+    func sessionConfiguration(_ sessionConfiguration: CPSessionConfiguration,
+                              limitedUserInterfacesChanged limitedUserInterfaces: CPLimitableUserInterface) {
+        Logger.carPlay.info("CarPlay limited UI changed: lists=\(limitedUserInterfaces.contains(.lists))")
+        guard let page = currentPage, let service = currentService else { return }
+        updateTemplate(page: page, service: service)
     }
+}
 
-    /// Renders a symbol-configured UIImage into a square canvas sized for CarPlay grid buttons,
-    /// preserving aspect ratio (aspect-fit)
-    private func renderSymbolImage(_ image: UIImage, pointSize: CGFloat, boxSize: CGSize) -> UIImage {
-        // Ensure a square canvas based on the smaller dimension of CarPlay's suggested size
-        let side = min(boxSize.width, boxSize.height)
-        let canvasSize = CGSize(width: side, height: side)
+// MARK: - CPInterfaceControllerDelegate
 
-        let drawRect = CGRect(x: 0, y: 0, width: side, height: side)
-
-        // Determine the size the image should be drawn at to preserve its aspect ratio inside drawRect
-        let imgSize = image.size
-        var target = drawRect
-        if imgSize.width > 0, imgSize.height > 0 {
-            let imgAspect = imgSize.width / imgSize.height
-            let boxAspect = drawRect.width / drawRect.height
-            if imgAspect > boxAspect {
-                // Image is wider: fit width, adjust height
-                let height = drawRect.width / imgAspect
-                target = CGRect(x: drawRect.minX, y: drawRect.midY - height / 2, width: drawRect.width, height: height)
-            } else {
-                // Image is taller: fit height, adjust width
-                let width = drawRect.height * imgAspect
-                target = CGRect(x: drawRect.midX - width / 2, y: drawRect.minY, width: width, height: drawRect.height)
-            }
-        }
-
-        // Render with correct scale
-        let format = UIGraphicsImageRendererFormat.default()
-        format.opaque = false
-        format.scale = UIScreen.main.scale
-        let renderer = UIGraphicsImageRenderer(size: canvasSize, format: format)
-        let rendered = renderer.image { _ in
-            // Fill nothing; keep transparent background so CarPlay can tint the template image
-            image.draw(in: target, blendMode: .normal, alpha: 1.0)
-        }
-        return rendered.withRenderingMode(.alwaysTemplate)
-    }
-
-    private func isCarPlayCompatible(_ widget: OpenHABWidget) -> Bool {
-        guard widget.type == .switchWidget, widget.item != nil else { return false }
-        return widget.mappings.isEmpty ||
-            (widget.mappings.count == 1 && widget.mappings[0].hasPressReleaseBehavior)
-    }
-
-    private func carPlayGridButtonImageSize() -> CGSize {
-        if #available(iOS 26.0, *) {
-            return CPGridTemplate.maximumGridButtonImageSize
-        }
-
-        // Conservative fallback for older CarPlay systems.
-        return CGSize(width: 80, height: 80)
-    }
-
-    private func makeGridButton(for widget: OpenHABWidget, service: OpenAPIService) -> CPGridButton {
-        let ds = widget.displayState
-        let image = sfSymbol(for: widget)
-        return CPGridButton(titleVariants: [ds.labelText], image: image) { _ in
-            Task {
-                guard let name = widget.item?.name else { return }
-                // Resolve press/release source: single mapping takes precedence over widget-level fields
-                let pressCommand: String?
-                let releaseCommand: String?
-                if let mapping = widget.mappings.first, mapping.hasPressReleaseBehavior {
-                    pressCommand = mapping.command.isEmpty ? nil : mapping.command
-                    releaseCommand = mapping.releaseCommand
-                } else {
-                    pressCommand = widget.releaseOnly != true ? widget.command : nil
-                    releaseCommand = widget.releaseCommand
-                }
-                if let pressCommand {
-                    try? await service.sendItemCommand(itemname: name, command: pressCommand)
-                    try? await Task.sleep(for: .milliseconds(500))
-                }
-                if let releaseCommand {
-                    try? await service.sendItemCommand(itemname: name, command: releaseCommand)
-                } else {
-                    // Read displayState live (not the `ds` captured at button-creation time):
-                    // with in-place button updates (iOS 26+) this closure can outlive many state
-                    // changes, so a captured snapshot would freeze the on/off guess at whatever
-                    // it was when the button was first built.
-                    try? await service.sendItemCommand(itemname: name, command: widget.displayState.isOn ? "OFF" : "ON")
-                }
-            }
-        }
-    }
-
-    private func placeholderButtonImage() -> UIImage {
-        UIImage(named: "openHABIcon")?
-            .withRenderingMode(.alwaysTemplate)
-            .withTintColor(.secondaryLabel, renderingMode: .alwaysOriginal)
-            ?? UIImage()
-    }
-
-    private func placeholderTemplate(message: String? = nil) -> CPTemplate {
-        guard let message else {
-            let button = CPGridButton(
-                titleVariants: [String(localized: "carplay_not_configured")],
-                image: placeholderButtonImage()
-            ) { _ in }
-            return CPGridTemplate(title: "openHAB", gridButtons: [button])
-        }
-        let item = CPInformationItem(title: nil, detail: message)
-        return CPInformationTemplate(title: "openHAB", layout: .leading, items: [item], actions: [])
+extension CarPlaySceneDelegate: CPInterfaceControllerDelegate {
+    func templateDidDisappear(_ aTemplate: CPTemplate, animated: Bool) {
+        guard detailTemplate?.template === aTemplate else { return }
+        detailTemplate = nil
     }
 }

@@ -91,10 +91,10 @@ public func openHABSFSymbol(for iconName: String, isOn: Bool) -> SFSymbol {
         isOn ? .sunMaxFill : .sunMax
     case "sun_clouds":
         isOn ? .cloudSunFill : .cloudSun
-//    case "temperature":
-//        .thermometerMedium // no fill
-//    case "wind":
-//        .wind // no fill
+    case "temperature":
+        .thermometerMedium // no fill
+    case "wind":
+        .wind // no fill
     // ── Properties ───────────────────────────────────────────────────────────
     case "carbondioxide":
         isOn ? .smokeFill : .smoke
